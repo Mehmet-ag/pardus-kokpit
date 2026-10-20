@@ -1,0 +1,5053 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Pardus 25.2 (Debian 13) Evrensel Gelişmiş Sistem Ayar İstasyonu (Split-View Curses TUI)
+
+Evrensel Donanım Keşfi (UniversalHardwareDetector):
+  - İşlemci : Intel / AMD / Evrensel CPU mimarisi, çekirdek sayısı, EPB, RAPL ve C-State yetenekleri
+  - Grafik  : Intel (i915), AMD (amdgpu/radeon), NVIDIA veya tümleşik/ayrık GPU tespiti
+  - Bellek  : Toplam fiziksel RAM kapasitesi (tmpfs /tmp, THP madvise, Düşük Swappiness)
+  - Depolama: SSD / NVMe (rotational=0) ve HDD (rotational=1) tespiti (noatime, mq-deadline, fstrim)
+  - Masaüstü: GNOME, XFCE, KDE Plasma veya genel X11/Wayland masaüstü ortamı tespiti
+
+Mimari Özellikler:
+  - Harici kütüphane bağımlılığı olmayan Saf Python 3 (Standart Kütüphane + Curses).
+  - Açılışta dinamik Yetki & Donanım Tarama Karşılama Ekranı.
+  - Donanımın desteklemediği ayarları otomatik olarak [DESTEKLENMİYOR] etiketiyle filtreleme.
+  - Bölünmüş Ekran (Split-View) Curses TUI Düzeni:
+      * Sol Panel : Kategorize edilmiş granüler ayarlar listesi ([X] / [ ] / [DESTEKLENMİYOR]).
+      * Sağ Panel : Seçili ayar için "İşlev", "Tespit Edilen Donanıma Etkisi"
+                    ve "Risk & Yan Etki" analiz bölmesi + canlı sistem değeri.
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import curses
+import dataclasses
+import datetime
+import json
+import locale
+import os
+import pwd
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import textwrap
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+
+# ==============================================================================
+# SABİTLER VE YAPILANDIRMA DOSYA YOLLARI
+# ==============================================================================
+
+
+# ==============================================================================
+# PARDUS KOKPİT - ORİJİNAL KURUMSAL PARS LOGOSU (ALTERNATİF 2)
+# ==============================================================================
+PARDUS_LOGO_SEGMENTS = [
+    [("             ▄▄               ▄▄             ", "gold")],
+    [("            ████▄           ▄████            ", "gold")],
+    [("           ▐██▀███▄  ▄▄▄▄  ▄███▀██▌          ", "gold")],
+    [("           ███  ▀████████████▀  ███          ", "gold")],
+    [("          ▐███ ▄ ▀██████████▀ ▄ ███▌         ", "gold")],
+    [("          ███████ ▐████████▌ ███████         ", "gold")],
+    [("          ███▀  ▀ ▄████████▄ ▀  ▀███         ", "gold")],
+    [("          ▐██  ▄███▀ ▀▀▀▀ ▀███▄  ██▌         ", "gold")],
+    [("           ▀█████▀  ", "gold"), ("▟█", "green"), ("  ", "gold"), ("█▙", "green"), ("  ▀█████▀          ", "gold")],
+    [("             ▀██   ", "gold"), ("▐██  ██▌", "white"), ("   ██▀            ", "gold")],
+    [("               ▀█▄  ", "gold"), ("▀▀  ▀▀", "white"), ("  ▄█▀              ", "gold")],
+    [("                 ▀██▄    ▄██▀                ", "gold")],
+    [("                   ▀██████▀                  ", "gold")],
+]
+
+# ==============================================================================
+# PARDUS KOKPİT - ORİJİNAL KURUMSAL PARS LOGOSU (ALTERNATİF 2)
+# ==============================================================================
+PARDUS_LOGO_SEGMENTS = [
+    [("             ▄▄               ▄▄             ", "gold")],
+    [("            ████▄           ▄████            ", "gold")],
+    [("           ▐██▀███▄  ▄▄▄▄  ▄███▀██▌          ", "gold")],
+    [("           ███  ▀████████████▀  ███          ", "gold")],
+    [("          ▐███ ▄ ▀██████████▀ ▄ ███▌         ", "gold")],
+    [("          ███████ ▐████████▌ ███████         ", "gold")],
+    [("          ███▀  ▀ ▄████████▄ ▀  ▀███         ", "gold")],
+    [("          ▐██  ▄███▀ ▀▀▀▀ ▀███▄  ██▌         ", "gold")],
+    [("           ▀█████▀  ", "gold"), ("▟█", "green"), ("  ", "gold"), ("█▙", "green"), ("  ▀█████▀          ", "gold")],
+    [("             ▀██   ", "gold"), ("▐██  ██▌", "white"), ("   ██▀            ", "gold")],
+    [("               ▀█▄  ", "gold"), ("▀▀  ▀▀", "white"), ("  ▄█▀              ", "gold")],
+    [("                 ▀██▄    ▄██▀                ", "gold")],
+    [("                   ▀██████▀                  ", "gold")],
+]
+
+STATE_DIR = Path("/var/lib/pardus-optimizer")
+STATE_FILE = STATE_DIR / "state_manifest.json"
+
+# Sistem yapılandırma dosya yolları (.bak yedekleme ve Rollback kapsamındadır)
+SYSCTL_CONF_PATH = Path("/etc/sysctl.d/99-pardus-optimizer.conf")
+CPU_GOV_SERVICE_PATH = Path("/etc/systemd/system/pardus-cpu-performance.service")
+CPUFREQUTILS_DEFAULT_PATH = Path("/etc/default/cpufrequtils")
+UDEV_SSD_RULES_PATH = Path("/etc/udev/rules.d/60-ssd-scheduler.rules")
+MODPROBE_I915_PATH = Path("/etc/modprobe.d/i915.conf")
+JOURNALD_LIMIT_CONF_PATH = Path("/etc/systemd/journald.conf.d/00-size-limit.conf")
+FSTAB_PATH = Path("/etc/fstab")
+TMPFILES_THP_PATH = Path("/etc/tmpfiles.d/pardus-thp.conf")
+TMPFILES_CSTATE_PATH = Path("/etc/tmpfiles.d/pardus-cstate.conf")
+TMPFILES_SCHED_PATH = Path("/etc/tmpfiles.d/pardus-sched.conf")
+TMPFILES_GPU_OC_PATH = Path("/etc/tmpfiles.d/pardus-gpu-oc.conf")
+TMPFILES_EPB_PATH = Path("/etc/tmpfiles.d/pardus-epb.conf")
+TMPFILES_RAPL_PATH = Path("/etc/tmpfiles.d/pardus-rapl.conf")
+MODULES_BBR_PATH = Path("/etc/modules-load.d/pardus-bbr.conf")
+
+# Temel hedef parametreler
+TARGET_CPU_GOVERNOR = "performance"
+TARGET_SSD_SCHEDULER = "mq-deadline"
+TARGET_GPU_BOOST_MHZ = 1050
+TARGET_EPB_PERFORMANCE = "0"
+TARGET_RAPL_PL1_UW = 35000000  # 35 Watt (mikrowatt cinsinden)
+TMPFS_MOUNT_UNIT = "tmp.mount"
+
+# Toplu uygulama (--apply) ve servis yöneticisinde kullanılan servis listesi
+SERVICES_TO_MASK: List[str] = [
+    "plymouth-quit-wait.service",
+    "NetworkManager-wait-online.service",
+    "systemd-networkd-wait-online.service",
+    "ModemManager.service",
+    "bluetooth.service",
+    "avahi-daemon.service",
+    "avahi-daemon.socket",
+    "cups.service",
+    "packagekit.service",
+    "apt-daily.timer",
+    "apt-daily-upgrade.timer",
+]
+
+TIMERS_TO_ENABLE: List[str] = [
+    "fstrim.timer",
+]
+
+GNOME_GSETTINGS_TARGETS: List[Tuple[str, str, str]] = [
+    ("org.gnome.desktop.interface", "enable-animations", "false"),
+    ("org.freedesktop.Tracker3.Miner.Files", "crawling-interval", "-2"),
+    ("org.freedesktop.Tracker3.Miner.Files", "enable-monitors", "false"),
+    ("org.gnome.Tracker3.Miner.Files", "crawling-interval", "-2"),
+    ("org.gnome.Tracker3.Miner.Files", "enable-monitors", "false"),
+]
+
+USER_SERVICES_TO_MASK: List[str] = [
+    "tracker-miner-fs-3.service",
+    "tracker-extract-3.service",
+    "tracker-miner-rss-3.service",
+    "localsearch-3.service",
+    "tinysparql-xdg-portal-3.service",
+]
+
+# Sistemde taranacak aday gereksiz masaüstü paketleri (GNOME oyunları, medya/harita, telemetri)
+DEBLOAT_CANDIDATES: Dict[str, str] = {
+    # GNOME Oyunları
+    "gnome-games": "GNOME oyunları üst paketi",
+    "gnome-2048": "GNOME 2048 bulmaca oyunu",
+    "aisleriot": "GNOME Solitaire kart oyunu koleksiyonu",
+    "gnome-chess": "GNOME 3B satranç oyunu",
+    "five-or-more": "GNOME renkli toplar bulmaca oyunu",
+    "four-in-a-row": "GNOME dörtlü sıra oyunu",
+    "hitori": "GNOME Hitori mantık bulmacası",
+    "iagno": "GNOME Reversi masa oyunu",
+    "gnome-klotski": "GNOME kayan bloklar bulmaca oyunu",
+    "lightsoff": "GNOME ışık kapatma bulmacası",
+    "gnome-mahjongg": "GNOME Mahjongg taş eşleştirme oyunu",
+    "gnome-mines": "GNOME Mayın Tarlası oyunu",
+    "gnome-nibbles": "GNOME Yılan (Nibbles) oyunu",
+    "quadrapassel": "GNOME Tetris benzeri blok oyunu",
+    "gnome-robots": "GNOME klasik robotlardan kaçış oyunu",
+    "gnome-sudoku": "GNOME Sudoku sayı bulmacası",
+    "swell-foop": "GNOME renkli blok patlatma oyunu",
+    "tali": "GNOME poker zarı oyunu",
+    "gnome-taquin": "GNOME 15-taş kaydırma bulmacası",
+    "gnome-tetravex": "GNOME kare eşleştirme bulmacası",
+    # Kullanılmayan Medya, Harita, İletişim ve Masaüstü Servis Uygulamaları
+    "gnome-maps": "GNOME harita ve navigasyon uygulaması",
+    "gnome-weather": "GNOME hava durumu uygulaması",
+    "gnome-music": "GNOME müzik çalar uygulaması",
+    "gnome-clocks": "GNOME dünya saatleri ve kronometre uygulaması",
+    "gnome-contacts": "GNOME kişi rehberi uygulaması",
+    "gnome-calendar": "GNOME takvim uygulaması",
+    "gnome-characters": "GNOME özel karakter ve emoji haritası",
+    "gnome-sound-recorder": "GNOME ses kayıt uygulaması",
+    "gnome-tour": "GNOME karşılama ve tanıtım turu",
+    "gnome-connections": "GNOME uzak masaüstü (RDP/VNC) bağlantı aracı",
+    "gnome-user-share": "GNOME WebDAV/Bluetooth kullanıcı dosya paylaşım servisi",
+    "rygel": "GNOME UPnP/DLNA medya akış sunucusu",
+    "rygel-playbin": "Rygel GStreamer medya oynatıcı eklentisi",
+    "rygel-tracker": "Rygel Tracker medya indeksleyici eklentisi",
+    "malcontent": "Ebeveyn denetimi ve uygulama kısıtlama çerçevesi",
+    "baobab": "GNOME disk kullanım analizörü",
+    "orca": "GNOME ekran okuyucu (erişilebilirlik servisi)",
+    "cheese": "GNOME web kamerası fotoğraf/video aracı",
+    "totem": "GNOME varsayılan video oynatıcısı",
+    "rhythmbox": "GNOME müzik yönetim ve çalma uygulaması",
+    "shotwell": "GNOME dijital fotoğraf düzenleyici ve yöneticisi",
+    "simple-scan": "GNOME belge tarayıcı uygulaması",
+    "transmission-gtk": "BitTorrent istemcisi (GTK arayüzü)",
+    "evolution": "GNOME kurumsal e-posta ve grup çalışması istemcisi",
+    # Telemetri, Hata Raporlama ve İstatistik Araçları
+    "popularity-contest": "Debian paket kullanım istatistiği/telemetri aracı",
+    "reportbug": "Debian/Pardus hata bildirim ve raporlama aracı",
+    "python3-reportbug": "Reportbug hata raporlama Python kütüphanesi",
+    "apport": "Otomatik çökme yakalama ve telemetri raporlayıcısı",
+    "whoopsie": "Arka plan çökme raporu gönderim servisi",
+    "zeitgeist": "Kullanıcı etkinlik ve dosya geçmişi izleme servisi",
+    "zeitgeist-core": "Zeitgeist etkinlik günlüğü çekirdek servisi",
+}
+
+# Kaldırılması kesinlikle VETO edilecek kritik sistem paketleri ve önekleri
+CRITICAL_PROTECTED_PACKAGES: Tuple[str, ...] = (
+    "gnome-shell",
+    "gnome-session",
+    "gnome-settings-daemon",
+    "gnome-control-center",
+    "gdm3",
+    "mutter",
+    "xorg",
+    "xserver-xorg",
+    "xserver-xorg-core",
+    "wayland",
+    "systemd",
+    "systemd-sysv",
+    "udev",
+    "dbus",
+    "network-manager",
+    "apt",
+    "dpkg",
+    "linux-image",
+    "sudo",
+    "polkitd",
+)
+
+CRITICAL_PROTECTED_PREFIXES: Tuple[str, ...] = (
+    "gnome-shell",
+    "gdm3",
+    "mutter",
+    "xorg",
+    "xserver-xorg",
+    "pardus-",
+    "linux-image-",
+)
+
+
+# ==============================================================================
+# GEÇİCİ DİZİN VE SİNYAL TEMİZLİK PROTOKOLÜ (TRAP EŞDEĞERİ)
+# ==============================================================================
+
+_ACTIVE_TEMP_DIRS: List[Path] = []
+_LOG_SINK: Optional[Callable[[str, str], None]] = None
+
+
+def _cleanup_temp_dirs() -> None:
+    """Betik sonlandığında tüm geçici dizinleri güvenli şekilde temizler."""
+    for tmp_dir in list(_ACTIVE_TEMP_DIRS):
+        try:
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        finally:
+            if tmp_dir in _ACTIVE_TEMP_DIRS:
+                _ACTIVE_TEMP_DIRS.remove(tmp_dir)
+
+
+def _signal_handler(signum: int, _frame: Any) -> None:
+    """SIGINT ve SIGTERM sinyallerini yakalayarak Curses ve geçici dosyaları temizler."""
+    try:
+        if not curses.isendwin():
+            curses.endwin()
+    except Exception:
+        pass
+    sys.stderr.write(f"\n[!] Sinyal alındı ({signum}). Geçici dosyalar temizleniyor ve çıkılıyor...\n")
+    _cleanup_temp_dirs()
+    sys.exit(128 + signum)
+
+
+atexit.register(_cleanup_temp_dirs)
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+
+def create_managed_temp_dir() -> Path:
+    """Çıkışta otomatik silinen güvenli bir geçici dizin oluşturur."""
+    tmp_path = Path(tempfile.mkdtemp(prefix="pardus_opt_"))
+    os.chmod(tmp_path, 0o700)
+    _ACTIVE_TEMP_DIRS.append(tmp_path)
+    return tmp_path
+
+
+# ==============================================================================
+# YARDIMCI FONKSİYONLAR, LOG YÖNLENDİRİCİ VE KOMUT YÜRÜTÜCÜ
+# ==============================================================================
+
+def set_log_sink(sink: Optional[Callable[[str, str], None]]) -> None:
+    """Curses TUI aktifken log mesajlarını TUI olay günlüğüne yönlendirir."""
+    global _LOG_SINK
+    _LOG_SINK = sink
+
+
+def log_info(msg: str) -> None:
+    if _LOG_SINK is not None:
+        _LOG_SINK("BİLGİ", msg)
+    else:
+        print(f"[BİLGİ] {msg}")
+
+
+def log_warn(msg: str) -> None:
+    if _LOG_SINK is not None:
+        _LOG_SINK("UYARI", msg)
+    else:
+        print(f"[UYARI] {msg}", file=sys.stderr)
+
+
+def log_error(msg: str) -> None:
+    if _LOG_SINK is not None:
+        _LOG_SINK("HATA", msg)
+    else:
+        print(f"[HATA]  {msg}", file=sys.stderr)
+
+
+def check_command_exists(cmd: str) -> bool:
+    """Sistemde ilgili komutun (binary) kurulu olup olmadığını kontrol eder."""
+    return shutil.which(cmd) is not None
+
+
+def run_cmd(
+    args: List[str],
+    check: bool = False,
+    env: Optional[Dict[str, str]] = None,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess[str]:
+    """
+    Alt süreçleri savunmacı (defensive) biçimde çalıştırır.
+    Kabuk enjeksiyonunu önlemek için shell=False kullanılır.
+    """
+    try:
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=check,
+            env=env,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        log_warn(f"Komut zaman aşımına uğradı ({timeout}s): {' '.join(args)}")
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=124,
+            stdout=exc.stdout or "",
+            stderr=exc.stderr or "TimeoutExpired",
+        )
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=127,
+            stdout="",
+            stderr=f"Komut bulunamadı: {args[0]}",
+        )
+    except subprocess.CalledProcessError as exc:
+        if check:
+            raise
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=exc.returncode,
+            stdout=exc.stdout or "",
+            stderr=exc.stderr or "",
+        )
+    except Exception as exc:
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout="",
+            stderr=str(exc),
+        )
+
+
+def is_root() -> bool:
+    """Etkin kullanıcının root (UID 0) olup olmadığını döndürür."""
+    return os.geteuid() == 0
+
+
+def require_root_privileges() -> None:
+    """CLI modunda sistem düzeyi değişiklikler için root (UID 0) yetkisini doğrular."""
+    if not is_root():
+        log_error("Bu işlem sistem yapılandırmasını değiştirdiği için root (sudo) yetkisi gerektirir.")
+        log_info(
+            "Lütfen komutu 'sudo python3 pardus_optimizer.py' "
+            "(veya --apply / --debloat / --rollback) şeklinde çalıştırın."
+        )
+        sys.exit(1)
+
+
+def detect_desktop_user() -> Optional[pwd.struct_passwd]:
+    """
+    En düşük ayrıcalık ilkesi gereği GNOME/Tracker ayarlarının uygulanacağı
+    gerçek masaüstü kullanıcısını tespit eder.
+    """
+    candidates: List[str] = []
+
+    for env_key in ("SUDO_USER", "PKEXEC_UID", "DOAS_USER"):
+        val = os.environ.get(env_key)
+        if val:
+            if env_key == "PKEXEC_UID" and val.isdigit():
+                try:
+                    candidates.append(pwd.getpwuid(int(val)).pw_name)
+                except KeyError:
+                    pass
+            else:
+                candidates.append(val)
+
+    if os.geteuid() != 0:
+        try:
+            candidates.append(pwd.getpwuid(os.geteuid()).pw_name)
+        except KeyError:
+            pass
+
+    if check_command_exists("loginctl"):
+        res = run_cmd(["loginctl", "list-users", "--no-legend"])
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].isdigit():
+                    uid = int(parts[0])
+                    if 1000 <= uid < 60000:
+                        candidates.append(parts[1])
+
+    try:
+        for entry in pwd.getpwall():
+            if 1000 <= entry.pw_uid < 60000 and entry.pw_shell not in ("/usr/sbin/nologin", "/bin/false"):
+                candidates.append(entry.pw_name)
+    except Exception:
+        pass
+
+    for username in candidates:
+        if username and username != "root":
+            try:
+                return pwd.getpwnam(username)
+            except KeyError:
+                continue
+
+    return None
+
+
+def run_as_desktop_user(
+    user_info: pwd.struct_passwd,
+    args: List[str],
+    timeout: int = 20,
+) -> subprocess.CompletedProcess[str]:
+    """
+    Bir komutu hedef masaüstü kullanıcısının UID/GID ve D-Bus oturum bağlamında çalıştırır.
+    Root yetkisiyle masaüstü ayarlarının bozulmasını engeller.
+    """
+    uid = user_info.pw_uid
+    username = user_info.pw_name
+    home_dir = user_info.pw_dir
+    runtime_dir = f"/run/user/{uid}"
+    dbus_socket = Path(f"{runtime_dir}/bus")
+
+    user_env = os.environ.copy()
+    user_env["HOME"] = home_dir
+    user_env["USER"] = username
+    user_env["LOGNAME"] = username
+    user_env["XDG_RUNTIME_DIR"] = runtime_dir
+
+    if dbus_socket.exists():
+        user_env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={dbus_socket}"
+
+    if os.geteuid() == uid:
+        if not dbus_socket.exists() and check_command_exists("dbus-run-session"):
+            return run_cmd(["dbus-run-session", "--"] + args, env=user_env, timeout=timeout)
+        return run_cmd(args, env=user_env, timeout=timeout)
+
+    env_assignments = [
+        f"HOME={home_dir}",
+        f"USER={username}",
+        f"LOGNAME={username}",
+        f"XDG_RUNTIME_DIR={runtime_dir}",
+    ]
+    if dbus_socket.exists():
+        env_assignments.append(f"DBUS_SESSION_BUS_ADDRESS=unix:path={dbus_socket}")
+
+    inner_cmd = args
+    if not dbus_socket.exists() and check_command_exists("dbus-run-session"):
+        inner_cmd = ["dbus-run-session", "--"] + args
+
+    if check_command_exists("runuser"):
+        full_cmd = ["runuser", "-u", username, "--", "env"] + env_assignments + inner_cmd
+    elif check_command_exists("sudo"):
+        full_cmd = ["sudo", "-u", username, "env"] + env_assignments + inner_cmd
+    else:
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=127,
+            stdout="",
+            stderr="Kullanıcı bağlamı değiştirmek için 'runuser' veya 'sudo' bulunamadı.",
+        )
+
+    return run_cmd(full_cmd, timeout=timeout)
+
+
+# ==============================================================================
+# EVRENSEL DONANIM VE ORTAM TARAYICI (UNIVERSAL HARDWARE DETECTOR)
+# ==============================================================================
+
+@dataclasses.dataclass
+class HardwareProfile:
+    """Sistem açılışında tespit edilen evrensel donanım ve masaüstü ortamı profili."""
+
+    cpu_vendor: str
+    cpu_model: str
+    cpu_cores: int
+    has_cpufreq: bool
+    has_intel_epb: bool
+    has_intel_rapl: bool
+    has_deep_cstate: bool
+    gpu_model: str
+    gpu_driver: str
+    has_intel_gpu: bool
+    has_intel_gpu_boost: bool
+    gpu_max_boost_mhz: int
+    ram_total_gb: float
+    ssd_devices: List[str]
+    hdd_devices: List[str]
+    has_ssd: bool
+    desktop_env: str
+    has_gnome: bool
+
+    def short_summary(self) -> str:
+        disk_str = (
+            f"SSD ({','.join(self.ssd_devices)})"
+            if self.ssd_devices
+            else (f"HDD ({','.join(self.hdd_devices)})" if self.hdd_devices else "Disk")
+        )
+        return (
+            f"{self.cpu_model} ({self.cpu_cores}C) │ {self.gpu_model} ({self.gpu_driver}) │ "
+            f"{self.ram_total_gb:.1f} GB RAM │ {disk_str} │ DE: {self.desktop_env}"
+        )
+
+
+class UniversalHardwareDetector:
+    """
+    Sistem açılışında CPU (Intel/AMD), GPU (i915/amdgpu/nvidia), RAM,
+    Disk (SSD/HDD) ve Masaüstü Ortamını (GNOME/XFCE/KDE) dinamik olarak tarar.
+    """
+
+    _cached_profile: Optional[HardwareProfile] = None
+
+    @classmethod
+    def detect(cls, force_refresh: bool = False) -> HardwareProfile:
+        if cls._cached_profile is not None and not force_refresh:
+            return cls._cached_profile
+
+        cpu_vendor, cpu_model, cpu_cores = cls._detect_cpu()
+        has_cpufreq = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").exists()
+        has_intel_epb = (
+            cpu_vendor == "Intel"
+            and Path("/sys/devices/system/cpu/cpu0/power/energy_perf_bias").exists()
+        )
+        has_intel_rapl = cpu_vendor == "Intel" and cls._detect_rapl_available()
+        has_deep_cstate = cls._detect_deep_cstate_available()
+
+        gpu_model, gpu_driver, has_intel_gpu, has_intel_gpu_boost, gpu_max_mhz = cls._detect_gpu()
+        ram_total_gb = cls._detect_ram_gb()
+        ssd_devs, hdd_devs = cls._detect_disks()
+        desktop_env, has_gnome = cls._detect_desktop_env()
+
+        cls._cached_profile = HardwareProfile(
+            cpu_vendor=cpu_vendor,
+            cpu_model=cpu_model,
+            cpu_cores=cpu_cores,
+            has_cpufreq=has_cpufreq,
+            has_intel_epb=has_intel_epb,
+            has_intel_rapl=has_intel_rapl,
+            has_deep_cstate=has_deep_cstate,
+            gpu_model=gpu_model,
+            gpu_driver=gpu_driver,
+            has_intel_gpu=has_intel_gpu,
+            has_intel_gpu_boost=has_intel_gpu_boost,
+            gpu_max_boost_mhz=gpu_max_mhz,
+            ram_total_gb=ram_total_gb,
+            ssd_devices=ssd_devs,
+            hdd_devices=hdd_devs,
+            has_ssd=len(ssd_devs) > 0,
+            desktop_env=desktop_env,
+            has_gnome=has_gnome,
+        )
+        return cls._cached_profile
+
+    @staticmethod
+    def _detect_cpu() -> Tuple[str, str, int]:
+        vendor = "Generic"
+        model = "Bilinmeyen İşlemci"
+        cores = os.cpu_count() or 1
+        cpuinfo = Path("/proc/cpuinfo")
+        if cpuinfo.exists():
+            try:
+                for line in cpuinfo.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if ":" not in line:
+                        continue
+                    k, v = [p.strip() for p in line.split(":", 1)]
+                    if k == "vendor_id":
+                        if "GenuineIntel" in v:
+                            vendor = "Intel"
+                        elif "AuthenticAMD" in v:
+                            vendor = "AMD"
+                        else:
+                            vendor = v
+                    elif k == "model name" and model == "Bilinmeyen İşlemci":
+                        model = re.sub(r"\s+", " ", v).strip()
+            except Exception:
+                pass
+        return vendor, model, cores
+
+    @staticmethod
+    def _detect_rapl_available() -> bool:
+        base = Path("/sys/class/powercap")
+        if not base.exists():
+            return False
+        for cand in base.glob("intel-rapl*"):
+            if (cand / "constraint_0_power_limit_uw").exists():
+                return True
+        rapl_sub = base / "intel-rapl"
+        if rapl_sub.exists():
+            for cand in rapl_sub.glob("intel-rapl*"):
+                if (cand / "constraint_0_power_limit_uw").exists():
+                    return True
+        return False
+
+    @staticmethod
+    def _detect_deep_cstate_available() -> bool:
+        base = Path("/sys/devices/system/cpu")
+        if not base.exists():
+            return False
+        for state_dir in base.glob("cpu[0-9]*/cpuidle/state[0-9]*"):
+            if (state_dir / "disable").exists():
+                if state_dir.name in ("state3", "state4", "state5", "state6"):
+                    return True
+                name_f = state_dir / "name"
+                try:
+                    if name_f.exists() and any(
+                        t in name_f.read_text(encoding="utf-8").upper() for t in ("C3", "C6", "C7")
+                    ):
+                        return True
+                except Exception:
+                    pass
+        return False
+
+    @staticmethod
+    def _detect_gpu() -> Tuple[str, str, bool, bool, int]:
+        gpu_model = "Standart Grafik Birimi"
+        gpu_driver = "generic"
+        if check_command_exists("lspci"):
+            res = run_cmd(["lspci"], timeout=5)
+            if res.returncode == 0:
+                for line in res.stdout.splitlines():
+                    if any(k in line for k in ("VGA compatible controller", "3D controller", "Display controller")):
+                        parts = line.split(":", 2)
+                        if len(parts) >= 3:
+                            gpu_model = parts[2].strip()
+                            break
+
+        drm_card = Path("/sys/class/drm/card0")
+        uevent_p = drm_card / "device/uevent"
+        if uevent_p.exists():
+            try:
+                for line in uevent_p.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if line.startswith("DRIVER="):
+                        gpu_driver = line.split("=", 1)[1].strip()
+                        break
+            except Exception:
+                pass
+        elif Path("/sys/module/i915").exists():
+            gpu_driver = "i915"
+        elif Path("/sys/module/amdgpu").exists():
+            gpu_driver = "amdgpu"
+
+        has_intel_gpu = gpu_driver == "i915" or Path("/sys/module/i915").exists()
+        gt_min = drm_card / "gt_min_freq_mhz"
+        gt_rp0 = drm_card / "gt_RP0_freq_mhz"
+        gt_max = drm_card / "gt_max_freq_mhz"
+        has_boost = has_intel_gpu and gt_min.exists()
+        max_mhz = TARGET_GPU_BOOST_MHZ
+        for freq_file in (gt_rp0, gt_max):
+            if freq_file.exists():
+                try:
+                    val = int(freq_file.read_text(encoding="utf-8").strip())
+                    if val > 0:
+                        max_mhz = val
+                        break
+                except Exception:
+                    pass
+        return gpu_model, gpu_driver, has_intel_gpu, has_boost, max_mhz
+
+    @staticmethod
+    def _detect_ram_gb() -> float:
+        meminfo = Path("/proc/meminfo")
+        if meminfo.exists():
+            try:
+                for line in meminfo.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("MemTotal:"):
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            return int(parts[1]) / (1024.0 * 1024.0)
+            except Exception:
+                pass
+        return 4.0
+
+    @staticmethod
+    def _detect_disks() -> Tuple[List[str], List[str]]:
+        ssd_list: List[str] = []
+        hdd_list: List[str] = []
+        sys_block = Path("/sys/block")
+        if sys_block.exists():
+            for dev_dir in sorted(sys_block.iterdir()):
+                name = dev_dir.name
+                if name.startswith(("loop", "ram", "sr", "dm-", "zram", "fd")):
+                    continue
+                rot_file = dev_dir / "queue/rotational"
+                if rot_file.exists():
+                    try:
+                        rot = rot_file.read_text(encoding="utf-8").strip()
+                        if rot == "0":
+                            ssd_list.append(name)
+                        else:
+                            hdd_list.append(name)
+                    except Exception:
+                        pass
+        return ssd_list, hdd_list
+
+    @staticmethod
+    def _detect_desktop_env() -> Tuple[str, bool]:
+        raw_de = (
+            os.environ.get("XDG_CURRENT_DESKTOP")
+            or os.environ.get("DESKTOP_SESSION")
+            or ""
+        ).upper()
+
+        detected = "Bilinmiyor"
+        if "GNOME" in raw_de:
+            detected = "GNOME"
+        elif "XFCE" in raw_de:
+            detected = "XFCE"
+        elif "KDE" in raw_de or "PLASMA" in raw_de:
+            detected = "KDE Plasma"
+        else:
+            res = run_cmd(["ps", "-eo", "comm"], timeout=5)
+            if res.returncode == 0:
+                procs = res.stdout.lower()
+                if "gnome-shell" in procs:
+                    detected = "GNOME"
+                elif "xfce4-session" in procs or "xfwm4" in procs:
+                    detected = "XFCE"
+                elif "plasmashell" in procs or "kwin" in procs:
+                    detected = "KDE Plasma"
+
+        if detected == "Bilinmiyor":
+            if check_command_exists("gnome-shell"):
+                detected = "GNOME"
+            elif check_command_exists("xfce4-session"):
+                detected = "XFCE"
+            elif check_command_exists("plasmashell"):
+                detected = "KDE Plasma"
+
+        has_gnome = detected == "GNOME" and check_command_exists("gsettings")
+        return detected, has_gnome
+
+
+# ==============================================================================
+# CANLI DONANIM TELEMETRİ OKUYUCU (ÜST PANEL İÇİN)
+# ==============================================================================
+
+class HardwareTelemetry:
+    """
+    Split-View Curses TUI üst bilgi paneli için canlı CPU Governor,
+    GPU Frekansı, EPB, RAPL, RAM kullanım oranı ve SSD I/O Scheduler verilerini okur.
+    """
+
+    @staticmethod
+    def get_gpu_freq_summary() -> str:
+        """Intel HD Graphics (i915) min/cur/boost frekans özetini döndürür."""
+        min_p = Path("/sys/class/drm/card0/gt_min_freq_mhz")
+        boost_p = Path("/sys/class/drm/card0/gt_boost_freq_mhz")
+        try:
+            if min_p.exists() and boost_p.exists():
+                mn = min_p.read_text(encoding="utf-8").strip()
+                bst = boost_p.read_text(encoding="utf-8").strip()
+                return f"{mn}/{bst}MHz"
+        except Exception:
+            pass
+        return "i915"
+
+    @staticmethod
+    def get_ram_summary() -> str:
+        """/proc/meminfo üzerinden kullanılan ve toplam RAM miktarını okur."""
+        meminfo = Path("/proc/meminfo")
+        if not meminfo.exists():
+            return "Bilinmiyor"
+        try:
+            data: Dict[str, int] = {}
+            for line in meminfo.read_text(encoding="utf-8").splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    parts = v.strip().split()
+                    if parts and parts[0].isdigit():
+                        data[k.strip()] = int(parts[0])
+            total_kb = data.get("MemTotal", 0)
+            avail_kb = data.get("MemAvailable", data.get("MemFree", 0))
+            if total_kb > 0:
+                used_kb = max(0, total_kb - avail_kb)
+                total_gb = total_kb / (1024.0 * 1024.0)
+                used_gb = used_kb / (1024.0 * 1024.0)
+                pct = int((used_kb / total_kb) * 100)
+                return f"{used_gb:.1f}/{total_gb:.1f} GB (%{pct})"
+        except Exception:
+            pass
+        return "Bilinmiyor"
+
+    @staticmethod
+    def get_cpu_governor_summary() -> str:
+        """Aktif CPU scaling_governor değerini döndürür."""
+        govs = CpuGovernorManager.get_current_governors()
+        if govs:
+            unique = sorted(set(govs))
+            return f"{','.join(unique)} ({len(govs)}C)"
+        return "cpufreq-yok"
+
+    @staticmethod
+    def get_ssd_scheduler_summary() -> str:
+        """Dönel olmayan (SSD) disklerin aktif I/O zamanlayıcısını döndürür."""
+        scheds = StorageAndKernelTuner.get_non_rotational_schedulers()
+        if not scheds:
+            return "SSD Yok"
+        parts = [f"{dev}:{sched}" for dev, sched in scheds.items()]
+        return ", ".join(parts)
+
+    @staticmethod
+    def get_tmpfs_summary() -> str:
+        """/tmp dizininin tmpfs üzerinde bağlı olup olmadığını döndürür."""
+        state = SystemdManager.get_unit_active_state(TMPFS_MOUNT_UNIT)
+        return "tmpfs (RAM)" if state == "active" else state
+
+
+# ==============================================================================
+# MODÜL 1: GÜVENLİK, YEDEKLEME (.bak) VE ROLLBACK YÖNETİCİSİ
+# ==============================================================================
+
+class StateManager:
+    """
+    Değiştirilen dosyaların (.bak) yedeklerini, granüler toggle durumlarını,
+    önceki sistem parametrelerini ve kaldırılan paketleri ('removed_packages')
+    JSON manifestosunda (state_manifest.json) saklar; Rollback çağrısında
+    tüm sistemi fabrika ayarlarına geri yükler.
+    """
+
+    ManagedPaths: Tuple[Path, ...] = (
+        SYSCTL_CONF_PATH,
+        CPU_GOV_SERVICE_PATH,
+        CPUFREQUTILS_DEFAULT_PATH,
+        UDEV_SSD_RULES_PATH,
+        MODPROBE_I915_PATH,
+        JOURNALD_LIMIT_CONF_PATH,
+        FSTAB_PATH,
+        TMPFILES_THP_PATH,
+        TMPFILES_CSTATE_PATH,
+        TMPFILES_SCHED_PATH,
+        TMPFILES_GPU_OC_PATH,
+        TMPFILES_EPB_PATH,
+        TMPFILES_RAPL_PATH,
+        MODULES_BBR_PATH,
+    )
+
+    def __init__(self) -> None:
+        self.data: Dict[str, Any] = {
+            "metadata": {
+                "created_at": "",
+                "updated_at": "",
+                "target_user": "",
+            },
+            "files": {},
+            "toggles": {},
+            "sysctl_active": {},
+            "sysctl_runtime": {},
+            "systemd_system": {},
+            "systemd_user": {},
+            "gsettings": {},
+            "cpu_governor": {},
+            "ssd_schedulers": {},
+            "thp_previous": "",
+            "cstate_previous": {},
+            "sched_previous": {},
+            "gpu_oc_previous": {},
+            "epb_previous": {},
+            "rapl_previous": {},
+            "removed_packages": [],
+        }
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if STATE_FILE.exists():
+                content = STATE_FILE.read_text(encoding="utf-8")
+                loaded = json.loads(content)
+                if isinstance(loaded, dict):
+                    self.data.update(loaded)
+                    for list_key in ("removed_packages",):
+                        if not isinstance(self.data.get(list_key), list):
+                            self.data[list_key] = []
+                    for dict_key in (
+                        "files",
+                        "toggles",
+                        "sysctl_active",
+                        "sysctl_runtime",
+                        "systemd_system",
+                        "systemd_user",
+                        "gsettings",
+                        "cpu_governor",
+                        "ssd_schedulers",
+                        "cstate_previous",
+                        "sched_previous",
+                        "gpu_oc_previous",
+                        "epb_previous",
+                        "rapl_previous",
+                    ):
+                        if not isinstance(self.data.get(dict_key), dict):
+                            self.data[dict_key] = {}
+        except PermissionError:
+            pass
+        except Exception as exc:
+            log_warn(f"Durum manifestosu okunamadı ({STATE_FILE}): {exc}")
+
+    def save(self) -> None:
+        """Durum manifestosunu atomik olarak diske yazar (izin: 0600)."""
+        if not is_root():
+            return
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(STATE_DIR, 0o700)
+
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        if not self.data["metadata"].get("created_at"):
+            self.data["metadata"]["created_at"] = now_iso
+        self.data["metadata"]["updated_at"] = now_iso
+
+        tmp_dir = create_managed_temp_dir()
+        tmp_file = tmp_dir / "state_manifest.json.tmp"
+        tmp_file.write_text(json.dumps(self.data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.chmod(tmp_file, 0o600)
+        shutil.move(str(tmp_file), str(STATE_FILE))
+
+    def set_toggle_state(self, toggle_id: str, enabled: bool) -> None:
+        """Bir ayarın açılıp kapatılmasını state_manifest.json içine kaydeder."""
+        self.data.setdefault("toggles", {})[toggle_id] = {
+            "enabled": enabled,
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        self.save()
+
+    def record_removed_package(self, package_name: str) -> None:
+        """Kaldırılan paketi state_manifest.json içindeki 'removed_packages' listesine kaydeder."""
+        if "removed_packages" not in self.data or not isinstance(self.data["removed_packages"], list):
+            self.data["removed_packages"] = []
+        if package_name not in self.data["removed_packages"]:
+            self.data["removed_packages"].append(package_name)
+            self.save()
+
+    def backup_and_write_file(self, target_path: Path, content: str, mode: int = 0o644) -> None:
+        """
+        Hedef dosya mevcutsa aynı dizinde '<dosya>.bak' yedeğini alır,
+        yoksa sonradan silinmek üzere 'existed_before: False' olarak işaretler.
+        Ardından yeni içeriği atomik olarak yazar.
+        """
+        target_str = str(target_path)
+        bak_path = Path(f"{target_str}.bak")
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if target_str not in self.data["files"]:
+            if target_path.exists():
+                shutil.copy2(target_path, bak_path)
+                self.data["files"][target_str] = {
+                    "existed_before": True,
+                    "bak_path": str(bak_path),
+                }
+                log_info(f"Yedek alındı: {target_path} -> {bak_path}")
+            else:
+                self.data["files"][target_str] = {
+                    "existed_before": False,
+                    "bak_path": str(bak_path),
+                }
+        else:
+            if self.data["files"][target_str].get("existed_before") and not bak_path.exists() and target_path.exists():
+                shutil.copy2(target_path, bak_path)
+
+        tmp_dir = create_managed_temp_dir()
+        tmp_file = tmp_dir / target_path.name
+        tmp_file.write_text(content, encoding="utf-8")
+        os.chmod(tmp_file, mode)
+        os.chown(tmp_file, 0, 0)
+        shutil.move(str(tmp_file), target_str)
+        self.save()
+
+    def restore_file(self, target_path: Path) -> bool:
+        """Dosyayı '.bak' yedeğinden geri yükler veya sonradan oluşturulduysa kaldırır."""
+        target_str = str(target_path)
+        bak_path = Path(f"{target_str}.bak")
+        file_meta = self.data.get("files", {}).get(target_str)
+
+        ephemeral_configs = (
+            SYSCTL_CONF_PATH,
+            CPU_GOV_SERVICE_PATH,
+            UDEV_SSD_RULES_PATH,
+            MODPROBE_I915_PATH,
+            JOURNALD_LIMIT_CONF_PATH,
+            TMPFILES_THP_PATH,
+            TMPFILES_CSTATE_PATH,
+            TMPFILES_SCHED_PATH,
+            TMPFILES_GPU_OC_PATH,
+            TMPFILES_EPB_PATH,
+            TMPFILES_RAPL_PATH,
+            MODULES_BBR_PATH,
+        )
+
+        try:
+            if bak_path.exists():
+                shutil.copy2(bak_path, target_path)
+                bak_path.unlink()
+                log_info(f"Yedekten geri yüklendi: {bak_path} -> {target_path}")
+            elif file_meta and not file_meta.get("existed_before", True):
+                if target_path.exists():
+                    target_path.unlink()
+                    log_info(f"Sonradan oluşturulan yapılandırma dosyası kaldırıldı: {target_path}")
+            elif target_path.exists() and target_path in ephemeral_configs:
+                target_path.unlink()
+                log_info(f"Optimizasyon yapılandırma dosyası kaldırıldı: {target_path}")
+
+            if target_str in self.data.get("files", {}):
+                del self.data["files"][target_str]
+            self.save()
+            return True
+        except Exception as exc:
+            log_error(f"Dosya geri yüklenirken hata oluştu ({target_path}): {exc}")
+            return False
+
+
+# ==============================================================================
+# MODÜL 2: GRANÜLER SYSCTL YÖNETİCİSİ (BELLEK, İŞLEMCİ VE AĞ PARAMETRELERİ)
+# ==============================================================================
+
+class SysctlTuner:
+    """
+    /etc/sysctl.d/99-pardus-optimizer.conf dosyasını hem tekil (granular)
+    hem de toplu olarak yönetir ve çekirdek parametrelerini canlı uygular.
+    """
+
+    DEFAULT_SYSCTL_BUNDLE: Dict[str, str] = {
+        "vm.swappiness": "10",
+        "vm.vfs_cache_pressure": "50",
+        "net.core.default_qdisc": "fq",
+        "net.ipv4.tcp_congestion_control": "bbr",
+        "net.ipv4.tcp_fastopen": "3",
+        "kernel.sched_autogroup_enabled": "1",
+    }
+
+    def __init__(self, state: StateManager) -> None:
+        self.state = state
+
+    @staticmethod
+    def get_current_value(key: str) -> str:
+        """Çekirdekten mevcut sysctl parametresini okur."""
+        proc_path = Path("/proc/sys") / key.replace(".", "/")
+        if proc_path.exists():
+            try:
+                return proc_path.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+        if check_command_exists("sysctl"):
+            res = run_cmd(["sysctl", "-n", key])
+            if res.returncode == 0:
+                return res.stdout.strip()
+        return "BİLİNMİYOR"
+
+    def _sync_conf_file(self) -> None:
+        """Aktif sysctl_active sözlüğünü /etc/sysctl.d/99-pardus-optimizer.conf dosyasına yazar."""
+        active_map: Dict[str, str] = self.state.data.get("sysctl_active", {})
+        if not active_map:
+            self.state.restore_file(SYSCTL_CONF_PATH)
+            return
+
+        hw = UniversalHardwareDetector.detect()
+        lines = [
+            "# ==============================================================================",
+            "# Pardus 25.2 (Debian 13) Bellek, İşlemci ve Ağ Optimizasyonu",
+            f"# Donanım: {hw.short_summary()}",
+            "# Bu dosya pardus_optimizer.py tarafından otomatik üretilmiştir.",
+            "# ==============================================================================",
+            "",
+        ]
+        for k, v in sorted(active_map.items()):
+            lines.append(f"{k} = {v}")
+        lines.append("")
+
+        self.state.backup_and_write_file(SYSCTL_CONF_PATH, "\n".join(lines), mode=0o644)
+
+    def set_param(self, key: str, value: str, enable: bool, fallback_default: str = "") -> bool:
+        """Tek bir sysctl parametresini etkinleştirir veya önceki değerine döndürür."""
+        if not check_command_exists("sysctl"):
+            log_error("'sysctl' aracı sistemde bulunamadı!")
+            return False
+
+        if enable:
+            if key not in self.state.data["sysctl_runtime"]:
+                cur_val = self.get_current_value(key)
+                if cur_val != "BİLİNMİYOR":
+                    self.state.data["sysctl_runtime"][key] = cur_val
+            self.state.data.setdefault("sysctl_active", {})[key] = value
+            self._sync_conf_file()
+            res = run_cmd(["sysctl", "-w", f"{key}={value}"])
+            if res.returncode == 0:
+                log_info(f"Sysctl parametresi etkinleştirildi: {key} = {value}")
+                return True
+            log_warn(f"Sysctl parametresi uygulanamadı ({key}={value}): {res.stderr.strip()}")
+            return False
+
+        # Devre dışı bırakma (Rollback single key)
+        if key in self.state.data.get("sysctl_active", {}):
+            del self.state.data["sysctl_active"][key]
+        self._sync_conf_file()
+
+        prev_val = self.state.data.get("sysctl_runtime", {}).pop(key, fallback_default)
+        if prev_val:
+            res = run_cmd(["sysctl", "-w", f"{key}={prev_val}"])
+            if res.returncode == 0:
+                log_info(f"Sysctl parametresi varsayılana döndürüldü: {key} = {prev_val}")
+        self.state.save()
+        return True
+
+    def apply(self) -> None:
+        """Tüm önerilen bellek ve ağ sysctl parametrelerini topluca uygular."""
+        log_info("Sysctl bellek ve ağ parametreleri yapılandırılıyor...")
+        # TCP BBR modülünü yükle
+        if check_command_exists("modprobe"):
+            run_cmd(["modprobe", "tcp_bbr"])
+        self.state.backup_and_write_file(MODULES_BBR_PATH, "tcp_bbr\n", mode=0o644)
+
+        for key, val in self.DEFAULT_SYSCTL_PARAMS().items():
+            self.set_param(key, val, enable=True)
+
+    @classmethod
+    def DEFAULT_SYSCTL_PARAMS(cls) -> Dict[str, str]:
+        return dict(cls.DEFAULT_SYSCTL_BUNDLE)
+
+    def rollback(self) -> None:
+        log_info("Sysctl bellek ve ağ ayarları eski haline döndürülüyor...")
+        self.state.restore_file(SYSCTL_CONF_PATH)
+        self.state.restore_file(MODULES_BBR_PATH)
+        self.state.data["sysctl_active"].clear()
+
+        if check_command_exists("sysctl"):
+            run_cmd(["sysctl", "--system"])
+            for key, prev_val in list(self.state.data.get("sysctl_runtime", {}).items()):
+                res = run_cmd(["sysctl", "-w", f"{key}={prev_val}"])
+                if res.returncode == 0:
+                    log_info(f"Sysctl geri yüklendi: {key} = {prev_val}")
+                del self.state.data["sysctl_runtime"][key]
+        self.state.save()
+
+
+# ==============================================================================
+# MODÜL 3: CPU GOVERNOR, C-STATE VE SCHEDULER OPTİMİZASYON MODÜLÜ
+# ==============================================================================
+
+class CpuGovernorManager:
+    """
+    Evrensel İşlemci Yöneticisi:
+      1. CPU scaling_governor -> 'performance' sabitleme.
+      2. Derin C-State uyku durumu (C3/C6 / state3+) gecikme kontrolü.
+      3. Çekirdek Zamanlayıcı (sched_latency_ns / EEVDF base_slice_ns & autogroup) optimizasyonu.
+    """
+
+    def __init__(self, state: StateManager) -> None:
+        self.state = state
+
+    @staticmethod
+    def get_governor_paths() -> List[Path]:
+        base = Path("/sys/devices/system/cpu")
+        if not base.exists():
+            return []
+        return sorted(base.glob("cpu[0-9]*/cpufreq/scaling_governor"))
+
+    @staticmethod
+    def get_available_governors() -> List[str]:
+        avail_path = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors")
+        if avail_path.exists():
+            try:
+                return avail_path.read_text(encoding="utf-8").strip().split()
+            except Exception:
+                pass
+        return []
+
+    @classmethod
+    def get_current_governors(cls) -> List[str]:
+        paths = cls.get_governor_paths()
+        if not paths:
+            return []
+        values: List[str] = []
+        for p in paths:
+            try:
+                values.append(p.read_text(encoding="utf-8").strip())
+            except Exception:
+                values.append("HATA")
+        return values
+
+    @classmethod
+    def set_runtime_governor(cls, governor: str) -> Tuple[bool, str]:
+        paths = cls.get_governor_paths()
+        if not paths:
+            return False, "cpufreq alt sistemi bulunamadı."
+
+        avail = cls.get_available_governors()
+        if avail and governor not in avail:
+            return False, f"'{governor}' desteklenmiyor (Mevcut: {', '.join(avail)})."
+
+        errors: List[str] = []
+        for p in paths:
+            try:
+                p.write_text(f"{governor}\n", encoding="utf-8")
+            except Exception as exc:
+                errors.append(f"{p}: {exc}")
+
+        if errors:
+            return False, "; ".join(errors)
+        return True, f"Tüm çekirdekler ({len(paths)} adet) '{governor}' moduna alındı."
+
+    def apply_governor(self) -> None:
+        hw = UniversalHardwareDetector.detect()
+        log_info(f"{hw.cpu_model} için CPU Governor 'performance' yapılandırması uygulanıyor...")
+        current_govs = self.get_current_governors()
+        if current_govs and "previous_governor" not in self.state.data["cpu_governor"]:
+            self.state.data["cpu_governor"]["previous_governor"] = current_govs[0]
+            self.state.save()
+
+        service_content = f"""# ==============================================================================
+# Pardus 25.2 (Debian 13) CPU Frekans Ölçekleyici Sabitleme Servisi
+# Donanım: {hw.cpu_model} ({hw.cpu_cores} Çekirdek)
+# Mikrotakılmaları önlemek için açılışta CPU governor'ı 'performance' yapar.
+# ==============================================================================
+[Unit]
+Description=Pardus Optimizer CPU Performance Governor Service
+After=multi-user.target
+ConditionPathExistsGlob=/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$f" ] && echo performance > "$f" || true; done'
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+"""
+        self.state.backup_and_write_file(CPU_GOV_SERVICE_PATH, service_content, mode=0o644)
+
+        if check_command_exists("cpufreq-set") or CPUFREQUTILS_DEFAULT_PATH.exists():
+            self.state.backup_and_write_file(CPUFREQUTILS_DEFAULT_PATH, 'GOVERNOR="performance"\n', mode=0o644)
+
+        if check_command_exists("systemctl"):
+            run_cmd(["systemctl", "daemon-reload"])
+            run_cmd(["systemctl", "enable", "--now", CPU_GOV_SERVICE_PATH.name])
+
+        ok, msg = self.set_runtime_governor(TARGET_CPU_GOVERNOR)
+        if ok:
+            log_info(msg)
+        else:
+            log_warn(f"Canlı CPU governor uyarısı: {msg}")
+        self.state.set_toggle_state("cpu_governor_perf", True)
+
+    def rollback_governor(self) -> None:
+        log_info("CPU Governor yapılandırması eski haline döndürülüyor...")
+        if check_command_exists("systemctl"):
+            run_cmd(["systemctl", "disable", "--now", CPU_GOV_SERVICE_PATH.name])
+
+        self.state.restore_file(CPU_GOV_SERVICE_PATH)
+        if str(CPUFREQUTILS_DEFAULT_PATH) in self.state.data.get("files", {}) or Path(f"{CPUFREQUTILS_DEFAULT_PATH}.bak").exists():
+            self.state.restore_file(CPUFREQUTILS_DEFAULT_PATH)
+
+        if check_command_exists("systemctl"):
+            run_cmd(["systemctl", "daemon-reload"])
+
+        prev_gov = self.state.data.get("cpu_governor", {}).get("previous_governor")
+        if not prev_gov:
+            avail = self.get_available_governors()
+            for fallback in ("schedutil", "ondemand", "powersave"):
+                if fallback in avail:
+                    prev_gov = fallback
+                    break
+
+        if prev_gov:
+            self.set_runtime_governor(prev_gov)
+        self.state.data["cpu_governor"].clear()
+        self.state.set_toggle_state("cpu_governor_perf", False)
+
+    # --- C-State Derin Uyku Gecikme Kontrolü ---
+    @staticmethod
+    def get_deep_cstate_paths() -> List[Path]:
+        """İşlemcide yüksek uyanma gecikmeli derin C-State (C3/C6 / state3+) disable yollarını döndürür."""
+        base = Path("/sys/devices/system/cpu")
+        if not base.exists():
+            return []
+        paths: List[Path] = []
+        for state_dir in sorted(base.glob("cpu[0-9]*/cpuidle/state[0-9]*")):
+            disable_file = state_dir / "disable"
+            name_file = state_dir / "name"
+            if not disable_file.exists():
+                continue
+            state_name = ""
+            try:
+                if name_file.exists():
+                    state_name = name_file.read_text(encoding="utf-8").strip().upper()
+            except Exception:
+                pass
+            if state_dir.name in ("state3", "state4", "state5", "state6") or any(
+                tag in state_name for tag in ("C3", "C6", "C7")
+            ):
+                paths.append(disable_file)
+        return paths
+
+    @classmethod
+    def is_cstate_latency_optimized(cls) -> Tuple[bool, str]:
+        paths = cls.get_deep_cstate_paths()
+        if not paths:
+            return TMPFILES_CSTATE_PATH.exists(), "cpuidle C3/C6 yok"
+        vals = []
+        for p in paths:
+            try:
+                vals.append(p.read_text(encoding="utf-8").strip())
+            except Exception:
+                vals.append("0")
+        all_disabled = all(v == "1" for v in vals)
+        return all_disabled, f"Derin C-State (C3/C6): {'Kapalı (Düşük Gecikme)' if all_disabled else 'Açık (Varsayılan)'}"
+
+    def set_cstate_latency(self, enable: bool) -> None:
+        paths = self.get_deep_cstate_paths()
+        if enable:
+            log_info("İşlemci derin C-State (C3/C6 / state3+) uyku gecikmesi sınırlandırılıyor...")
+            tmp_lines = ["# Pardus Optimizer - Derin C-State (C3/C6) uyanma gecikmesini önle"]
+            for p in paths:
+                key = str(p)
+                try:
+                    if key not in self.state.data["cstate_previous"]:
+                        self.state.data["cstate_previous"][key] = p.read_text(encoding="utf-8").strip()
+                    p.write_text("1\n", encoding="utf-8")
+                    tmp_lines.append(f"w {p} - - - - 1")
+                except Exception as exc:
+                    log_warn(f"C-State yazılamadı ({p}): {exc}")
+            if len(tmp_lines) == 1:
+                tmp_lines.extend(
+                    [
+                        "w /sys/devices/system/cpu/cpu0/cpuidle/state3/disable - - - - 1",
+                        "w /sys/devices/system/cpu/cpu1/cpuidle/state3/disable - - - - 1",
+                    ]
+                )
+            self.state.backup_and_write_file(TMPFILES_CSTATE_PATH, "\n".join(tmp_lines) + "\n", mode=0o644)
+            self.state.set_toggle_state("cpu_cstate_latency", True)
+            log_info("Derin C-State (C3/C6) devre dışı bırakıldı; çekirdek uyanma gecikmesi minimize edildi.")
+        else:
+            log_info("C-State uyku durumları varsayılan değerlerine döndürülüyor...")
+            self.state.restore_file(TMPFILES_CSTATE_PATH)
+            for p in paths:
+                prev = self.state.data.get("cstate_previous", {}).pop(str(p), "0")
+                try:
+                    p.write_text(f"{prev}\n", encoding="utf-8")
+                except Exception:
+                    pass
+            self.state.set_toggle_state("cpu_cstate_latency", False)
+
+    # --- Scheduler Latency (sched_latency_ns / EEVDF base_slice_ns & autogroup) ---
+    @staticmethod
+    def get_sched_latency_status() -> Tuple[bool, str]:
+        """Hem Linux <6.6 sched_latency_ns hem de Linux 6.6+ EEVDF base_slice_ns / autogroup durumunu okur."""
+        legacy_path = Path("/proc/sys/kernel/sched_latency_ns")
+        eevdf_path = Path("/sys/kernel/debug/sched/base_slice_ns")
+        autogroup_path = Path("/proc/sys/kernel/sched_autogroup_enabled")
+
+        if legacy_path.exists():
+            try:
+                val = legacy_path.read_text(encoding="utf-8").strip()
+                return val == "4000000", f"sched_latency_ns={val}"
+            except Exception:
+                pass
+
+        try:
+            if eevdf_path.exists():
+                val = eevdf_path.read_text(encoding="utf-8").strip()
+                if val == "2000000" or TMPFILES_SCHED_PATH.exists():
+                    return True, f"base_slice_ns={val} (EEVDF)"
+        except PermissionError:
+            if TMPFILES_SCHED_PATH.exists():
+                return True, "EEVDF 2ms (Yapılandırıldı)"
+        except Exception:
+            pass
+
+        ag_val = "1"
+        if autogroup_path.exists():
+            try:
+                ag_val = autogroup_path.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+        is_opt = TMPFILES_SCHED_PATH.exists() and ag_val == "1"
+        return is_opt, f"autogroup={ag_val}, profil={'Aktif' if is_opt else 'Varsayılan'}"
+
+    def set_sched_latency(self, enable: bool, sysctl_tuner: SysctlTuner) -> None:
+        legacy_path = Path("/proc/sys/kernel/sched_latency_ns")
+        eevdf_path = Path("/sys/kernel/debug/sched/base_slice_ns")
+
+        if enable:
+            log_info("İşlemci zamanlayıcı gecikmesi (sched_latency_ns / EEVDF slice) masaüstü için optimize ediliyor...")
+            sysctl_tuner.set_param("kernel.sched_autogroup_enabled", "1", enable=True, fallback_default="1")
+            if legacy_path.exists():
+                sysctl_tuner.set_param("kernel.sched_latency_ns", "4000000", enable=True, fallback_default="6000000")
+            try:
+                if eevdf_path.exists():
+                    if "base_slice_ns" not in self.state.data["sched_previous"]:
+                        self.state.data["sched_previous"]["base_slice_ns"] = eevdf_path.read_text(encoding="utf-8").strip()
+                    eevdf_path.write_text("2000000\n", encoding="utf-8")
+            except Exception:
+                pass
+            tmpfiles_sched = (
+                "# Pardus Optimizer - Masaüstü düşük gecikmeli zamanlayıcı dilimi (2ms)\n"
+                "w /sys/kernel/debug/sched/base_slice_ns - - - - 2000000\n"
+            )
+            self.state.backup_and_write_file(TMPFILES_SCHED_PATH, tmpfiles_sched, mode=0o644)
+            self.state.set_toggle_state("cpu_sched_latency", True)
+            log_info("Zamanlayıcı gecikme optimizasyonu etkinleştirildi.")
+        else:
+            log_info("Zamanlayıcı gecikme parametreleri varsayılana döndürülüyor...")
+            self.state.restore_file(TMPFILES_SCHED_PATH)
+            if legacy_path.exists():
+                sysctl_tuner.set_param("kernel.sched_latency_ns", "6000000", enable=False, fallback_default="6000000")
+            try:
+                if eevdf_path.exists():
+                    prev_slice = self.state.data.get("sched_previous", {}).pop("base_slice_ns", "3000000")
+                    eevdf_path.write_text(f"{prev_slice}\n", encoding="utf-8")
+            except Exception:
+                pass
+            self.state.set_toggle_state("cpu_sched_latency", False)
+
+    def apply(self) -> None:
+        self.apply_governor()
+        self.set_cstate_latency(True)
+        self.set_sched_latency(True, SysctlTuner(self.state))
+
+    def rollback(self) -> None:
+        self.rollback_governor()
+        self.set_cstate_latency(False)
+        self.set_sched_latency(False, SysctlTuner(self.state))
+
+
+# ==============================================================================
+# MODÜL 3B: DONANIM GÜÇ KİLİDİ AÇMA VE OVERCLOCK MODÜLÜ (HARDWARE POWER TUNER)
+# ==============================================================================
+
+class HardwarePowerTuner:
+    """
+    Evrensel Donanım Güç Kilidi Açma ve Overclock Modülü (Hardware Power Uncap):
+      1. GPU Overclock / Saat Kilitleme:
+         '/sys/class/drm/card0/gt_min_freq_mhz' ve 'gt_boost_freq_mhz' değerlerini
+         donanımın izin verdiği en tepe dinamik frekansa (gt_RP0_freq_mhz) kilitler.
+      2. Intel EPB (Energy-Performance Bias) Ayarı:
+         '/sys/devices/system/cpu/cpu*/power/energy_perf_bias' üzerinden tüm çekirdekleri
+         'performance' (0) seviyesine çeker.
+      3. Intel RAPL Güç Sınırı Tavanı:
+         Varsa '/sys/class/powercap/intel-rapl' düğümlerinde paket güç sınırını (PL1/PL2)
+         35W (35000000 uW) seviyesine sabitleyerek OEM termal kısmasını (throttling) geciktirir.
+      4. C-State Düşük Gecikme Modu:
+         İşlemcinin derin uyku modlarını (C3/C6) engelleyerek masaüstü tepkiselliğini
+         en üst seviyeye taşır.
+    """
+
+    DRM_CARD_DIR = Path("/sys/class/drm/card0")
+    GT_MIN_PATH = DRM_CARD_DIR / "gt_min_freq_mhz"
+    GT_MAX_PATH = DRM_CARD_DIR / "gt_max_freq_mhz"
+    GT_BOOST_PATH = DRM_CARD_DIR / "gt_boost_freq_mhz"
+    GT_RP0_PATH = DRM_CARD_DIR / "gt_RP0_freq_mhz"
+    GT_RPN_PATH = DRM_CARD_DIR / "gt_RPn_freq_mhz"
+
+    def __init__(self, state: StateManager) -> None:
+        self.state = state
+
+    # --- 1. GPU Overclock / Saat Kilitleme (1050 MHz) ---
+    @classmethod
+    def get_target_gpu_max_mhz(cls) -> int:
+        if cls.GT_RP0_PATH.exists():
+            try:
+                val = int(cls.GT_RP0_PATH.read_text(encoding="utf-8").strip())
+                if val > 0:
+                    return val
+            except Exception:
+                pass
+        return TARGET_GPU_BOOST_MHZ
+
+    @classmethod
+    def get_gpu_boost_status(cls) -> Tuple[bool, str]:
+        if not cls.GT_MIN_PATH.exists():
+            return TMPFILES_GPU_OC_PATH.exists(), "gt_min_freq_mhz yok"
+        try:
+            target = str(cls.get_target_gpu_max_mhz())
+            cur_min = cls.GT_MIN_PATH.read_text(encoding="utf-8").strip()
+            cur_boost = (
+                cls.GT_BOOST_PATH.read_text(encoding="utf-8").strip()
+                if cls.GT_BOOST_PATH.exists()
+                else target
+            )
+            locked = cur_min == target and cur_boost == target
+            return locked, f"min={cur_min}MHz, boost={cur_boost}MHz (Hedef: {target}MHz)"
+        except Exception:
+            return False, "Okunamadı"
+
+    def set_gpu_boost(self, enable: bool) -> None:
+        target_str = str(self.get_target_gpu_max_mhz())
+        if enable:
+            log_info(f"Intel HD Graphics (i915) GPU frekansı {target_str} MHz tavan değerine kilitleniyor...")
+            for path_obj in (self.GT_MAX_PATH, self.GT_BOOST_PATH, self.GT_MIN_PATH):
+                if path_obj.exists():
+                    key = str(path_obj)
+                    try:
+                        if key not in self.state.data["gpu_oc_previous"]:
+                            self.state.data["gpu_oc_previous"][key] = path_obj.read_text(encoding="utf-8").strip()
+                        path_obj.write_text(f"{target_str}\n", encoding="utf-8")
+                    except Exception as exc:
+                        log_warn(f"GPU frekans düğümü yazılamadı ({path_obj}): {exc}")
+
+            tmpfiles_gpu = (
+                f"# Pardus Optimizer - Intel HD Graphics (i915) {target_str} MHz Saat Kilitleme\n"
+                f"w {self.GT_MAX_PATH} - - - - {target_str}\n"
+                f"w {self.GT_BOOST_PATH} - - - - {target_str}\n"
+                f"w {self.GT_MIN_PATH} - - - - {target_str}\n"
+            )
+            self.state.backup_and_write_file(TMPFILES_GPU_OC_PATH, tmpfiles_gpu, mode=0o644)
+            self.state.set_toggle_state("oc_gpu_boost_1050", True)
+            log_info(f"GPU gt_min_freq_mhz ve gt_boost_freq_mhz {target_str} MHz olarak sabitlendi.")
+        else:
+            log_info("Intel HD Graphics (i915) GPU saat kilidi varsayılan değerlere döndürülüyor...")
+            self.state.restore_file(TMPFILES_GPU_OC_PATH)
+            default_min = "650"
+            if self.GT_RPN_PATH.exists():
+                try:
+                    default_min = self.GT_RPN_PATH.read_text(encoding="utf-8").strip() or "650"
+                except Exception:
+                    pass
+            for path_obj, fallback in (
+                (self.GT_MIN_PATH, default_min),
+                (self.GT_BOOST_PATH, target_str),
+                (self.GT_MAX_PATH, target_str),
+            ):
+                prev = self.state.data.get("gpu_oc_previous", {}).pop(str(path_obj), fallback)
+                if path_obj.exists():
+                    try:
+                        path_obj.write_text(f"{prev}\n", encoding="utf-8")
+                    except Exception:
+                        pass
+            self.state.set_toggle_state("oc_gpu_boost_1050", False)
+
+    # --- 2. Intel EPB (Energy-Performance Bias) Ayarı ---
+    @staticmethod
+    def get_epb_paths() -> List[Path]:
+        base = Path("/sys/devices/system/cpu")
+        if not base.exists():
+            return []
+        return sorted(base.glob("cpu[0-9]*/power/energy_perf_bias"))
+
+    @classmethod
+    def get_epb_status(cls) -> Tuple[bool, str]:
+        paths = cls.get_epb_paths()
+        if not paths:
+            return TMPFILES_EPB_PATH.exists(), "energy_perf_bias yok"
+        vals: List[str] = []
+        for p in paths:
+            try:
+                vals.append(p.read_text(encoding="utf-8").strip())
+            except Exception:
+                vals.append("6")
+        is_perf = all(v in ("0", "performance") for v in vals)
+        uniq = ",".join(sorted(set(vals)))
+        return is_perf, f"EPB={uniq} ({'0:performance' if is_perf else '6:normal'})"
+
+    def set_epb_performance(self, enable: bool) -> None:
+        paths = self.get_epb_paths()
+        if enable:
+            log_info("Intel EPB (Energy-Performance Bias) tüm çekirdeklerde 'performance' (0) seviyesine çekiliyor...")
+            tmp_lines = ["# Pardus Optimizer - Intel EPB (Energy-Performance Bias) Performance (0)"]
+            for p in paths:
+                key = str(p)
+                try:
+                    if key not in self.state.data["epb_previous"]:
+                        self.state.data["epb_previous"][key] = p.read_text(encoding="utf-8").strip()
+                    p.write_text("0\n", encoding="utf-8")
+                    tmp_lines.append(f"w {p} - - - - 0")
+                except Exception as exc:
+                    log_warn(f"EPB düğümü yazılamadı ({p}): {exc}")
+            self.state.backup_and_write_file(TMPFILES_EPB_PATH, "\n".join(tmp_lines) + "\n", mode=0o644)
+            self.state.set_toggle_state("oc_cpu_epb_perf", True)
+            log_info("Intel EPB tüm çekirdeklerde '0' (performance) olarak ayarlandı.")
+        else:
+            log_info("Intel EPB (Energy-Performance Bias) varsayılan (6 - normal) değerine döndürülüyor...")
+            self.state.restore_file(TMPFILES_EPB_PATH)
+            for p in paths:
+                prev = self.state.data.get("epb_previous", {}).pop(str(p), "6")
+                try:
+                    p.write_text(f"{prev}\n", encoding="utf-8")
+                except Exception:
+                    pass
+            self.state.set_toggle_state("oc_cpu_epb_perf", False)
+
+    # --- 3. Intel RAPL Güç Sınırı Tavanı (PL1/PL2 35W) ---
+    @staticmethod
+    def get_rapl_package_dirs() -> List[Path]:
+        base = Path("/sys/class/powercap")
+        if not base.exists():
+            return []
+        pkg_dirs: List[Path] = []
+        for candidate in sorted(base.glob("intel-rapl:[0-9]*")):
+            if (candidate / "constraint_0_power_limit_uw").exists():
+                pkg_dirs.append(candidate)
+        if not pkg_dirs:
+            rapl_root = base / "intel-rapl"
+            if rapl_root.exists():
+                for candidate in sorted(rapl_root.glob("intel-rapl:[0-9]*")):
+                    if (candidate / "constraint_0_power_limit_uw").exists():
+                        pkg_dirs.append(candidate)
+        return pkg_dirs
+
+    @classmethod
+    def get_rapl_status(cls) -> Tuple[bool, str]:
+        pkg_dirs = cls.get_rapl_package_dirs()
+        if not pkg_dirs:
+            return TMPFILES_RAPL_PATH.exists(), "intel-rapl yok"
+        pkg = pkg_dirs[0]
+        pl1_file = pkg / "constraint_0_power_limit_uw"
+        pl2_file = pkg / "constraint_1_power_limit_uw"
+        try:
+            pl1_uw = int(pl1_file.read_text(encoding="utf-8").strip())
+            pl2_uw = int(pl2_file.read_text(encoding="utf-8").strip()) if pl2_file.exists() else pl1_uw
+            pl1_w = pl1_uw / 1_000_000.0
+            pl2_w = pl2_uw / 1_000_000.0
+            is_uncapped = pl1_uw >= TARGET_RAPL_PL1_UW and TMPFILES_RAPL_PATH.exists()
+            return is_uncapped, f"PL1={pl1_w:.1f}W, PL2={pl2_w:.1f}W"
+        except Exception:
+            return False, "Okunamadı"
+
+    def set_rapl_power_limit(self, enable: bool) -> None:
+        pkg_dirs = self.get_rapl_package_dirs()
+        target_uw = str(TARGET_RAPL_PL1_UW)
+        if enable:
+            log_info("Intel RAPL paket güç sınırı (PL1/PL2) 35W (35000000 uW) tavanına sabitleniyor...")
+            tmp_lines = ["# Pardus Optimizer - Intel RAPL Paket Güç Sınırı Tavanı (35W Uncap)"]
+            for pkg in pkg_dirs:
+                pl1_path = pkg / "constraint_0_power_limit_uw"
+                pl2_path = pkg / "constraint_1_power_limit_uw"
+                if pl1_path.exists():
+                    k1 = str(pl1_path)
+                    try:
+                        if k1 not in self.state.data["rapl_previous"]:
+                            self.state.data["rapl_previous"][k1] = pl1_path.read_text(encoding="utf-8").strip()
+                        pl1_path.write_text(f"{target_uw}\n", encoding="utf-8")
+                        tmp_lines.append(f"w {pl1_path} - - - - {target_uw}")
+                    except Exception as exc:
+                        log_warn(f"RAPL PL1 yazılamadı ({pl1_path}): {exc}")
+                if pl2_path.exists():
+                    k2 = str(pl2_path)
+                    try:
+                        cur_pl2 = pl2_path.read_text(encoding="utf-8").strip()
+                        if k2 not in self.state.data["rapl_previous"]:
+                            self.state.data["rapl_previous"][k2] = cur_pl2
+                        new_pl2 = str(max(int(cur_pl2), TARGET_RAPL_PL1_UW)) if cur_pl2.isdigit() else target_uw
+                        pl2_path.write_text(f"{new_pl2}\n", encoding="utf-8")
+                        tmp_lines.append(f"w {pl2_path} - - - - {new_pl2}")
+                    except Exception as exc:
+                        log_warn(f"RAPL PL2 yazılamadı ({pl2_path}): {exc}")
+
+            self.state.backup_and_write_file(TMPFILES_RAPL_PATH, "\n".join(tmp_lines) + "\n", mode=0o644)
+            self.state.set_toggle_state("oc_rapl_35w", True)
+            log_info("Intel RAPL güç sınırı 35W seviyesine sabitlendi.")
+        else:
+            log_info("Intel RAPL güç sınırı önceki değerlerine döndürülüyor...")
+            self.state.restore_file(TMPFILES_RAPL_PATH)
+            for path_str, prev_val in list(self.state.data.get("rapl_previous", {}).items()):
+                p = Path(path_str)
+                if p.exists():
+                    try:
+                        p.write_text(f"{prev_val}\n", encoding="utf-8")
+                    except Exception:
+                        pass
+                del self.state.data["rapl_previous"][path_str]
+            self.state.set_toggle_state("oc_rapl_35w", False)
+
+    def apply(self) -> None:
+        hw = UniversalHardwareDetector.detect()
+        if hw.has_intel_gpu_boost:
+            self.set_gpu_boost(True)
+        else:
+            log_info("[DESTEKLENMİYOR] Intel i915 GPU Boost bulunamadı, atlanıyor.")
+        if hw.has_intel_epb:
+            self.set_epb_performance(True)
+        else:
+            log_info("[DESTEKLENMİYOR] Intel EPB arayüzü bulunamadı, atlanıyor.")
+        if hw.has_intel_rapl:
+            self.set_rapl_power_limit(True)
+        else:
+            log_info("[DESTEKLENMİYOR] Intel RAPL arayüzü bulunamadı, atlanıyor.")
+        if hw.has_deep_cstate:
+            CpuGovernorManager(self.state).set_cstate_latency(True)
+        else:
+            log_info("[DESTEKLENMİYOR] Derin C-State arayüzü bulunamadı, atlanıyor.")
+
+    def rollback(self) -> None:
+        self.set_gpu_boost(False)
+        self.set_epb_performance(False)
+        self.set_rapl_power_limit(False)
+        CpuGovernorManager(self.state).set_cstate_latency(False)
+
+
+# ==============================================================================
+# MODÜL 4: BELLEK (THP, DROP_CACHES) VE DEPOLAMA (FSTAB NOATIME, SSD, I915, JOURNALD)
+# ==============================================================================
+
+class StorageAndKernelTuner:
+    """
+    Bellek, Depolama ve Grafik Donanım Seviyesi Optimizasyonları:
+      1. THP (Transparent Hugepages -> 'madvise')
+      2. PageCache / Inode / Dentry önbellek temizleyici (drop_caches=3)
+      3. /etc/fstab 'noatime' disk yazma optimizasyonu
+      4. SSD I/O Scheduler (/etc/udev/rules.d/60-ssd-scheduler.rules -> 'mq-deadline')
+      5. Intel i915 GPU Framebuffer Compression (/etc/modprobe.d/i915.conf -> enable_fbc=1)
+      6. Journald Disk Boyutu Sınırı (/etc/systemd/journald.conf.d/00-size-limit.conf -> 100M/50M)
+    """
+
+    THP_ENABLED_PATH = Path("/sys/kernel/mm/transparent_hugepage/enabled")
+    THP_DEFRAG_PATH = Path("/sys/kernel/mm/transparent_hugepage/defrag")
+
+    def __init__(self, state: StateManager) -> None:
+        self.state = state
+
+    @staticmethod
+    def _parse_bracketed_value(raw_str: str) -> str:
+        """'always [madvise] never' biçimindeki sysfs çıktısından aktif değeri ayıklar."""
+        match = re.search(r"\[([^\]]+)\]", raw_str)
+        if match:
+            return match.group(1).strip()
+        return raw_str.strip()
+
+    # --- 1. Transparent Hugepages (THP -> madvise) ---
+    @classmethod
+    def get_thp_status(cls) -> Tuple[bool, str]:
+        if not cls.THP_ENABLED_PATH.exists():
+            return False, "Desteklenmiyor"
+        try:
+            raw = cls.THP_ENABLED_PATH.read_text(encoding="utf-8").strip()
+            active = cls._parse_bracketed_value(raw)
+            is_opt = active in ("madvise", "never") and TMPFILES_THP_PATH.exists()
+            return is_opt, f"{active} ({'Kalıcı' if TMPFILES_THP_PATH.exists() else 'Varsayılan'})"
+        except Exception:
+            return False, "Okunamadı"
+
+    def set_thp_madvise(self, enable: bool) -> None:
+        if enable:
+            log_info("Transparent Hugepages (THP) 'madvise' moduna sabitleniyor...")
+            if self.THP_ENABLED_PATH.exists():
+                try:
+                    cur = self._parse_bracketed_value(self.THP_ENABLED_PATH.read_text(encoding="utf-8"))
+                    if not self.state.data.get("thp_previous"):
+                        self.state.data["thp_previous"] = cur
+                    self.THP_ENABLED_PATH.write_text("madvise\n", encoding="utf-8")
+                except Exception as exc:
+                    log_warn(f"THP sysfs yazılamadı: {exc}")
+            if self.THP_DEFRAG_PATH.exists():
+                try:
+                    self.THP_DEFRAG_PATH.write_text("madvise\n", encoding="utf-8")
+                except Exception:
+                    pass
+            tmpfiles_thp = (
+                "# Pardus Optimizer - Fiziksel RAM için THP madvise sabitlemesi\n"
+                "w /sys/kernel/mm/transparent_hugepage/enabled - - - - madvise\n"
+                "w /sys/kernel/mm/transparent_hugepage/defrag - - - - madvise\n"
+            )
+            self.state.backup_and_write_file(TMPFILES_THP_PATH, tmpfiles_thp, mode=0o644)
+            self.state.set_toggle_state("mem_thp_madvise", True)
+            log_info("THP 'madvise' olarak yapılandırıldı.")
+        else:
+            log_info("THP yapılandırması geri alınıyor...")
+            self.state.restore_file(TMPFILES_THP_PATH)
+            prev = self.state.data.get("thp_previous") or "madvise"
+            if self.THP_ENABLED_PATH.exists():
+                try:
+                    self.THP_ENABLED_PATH.write_text(f"{prev}\n", encoding="utf-8")
+                except Exception:
+                    pass
+            self.state.data["thp_previous"] = ""
+            self.state.set_toggle_state("mem_thp_madvise", False)
+
+    # --- 2. drop_caches Tetikleyici ---
+    def trigger_drop_caches(self) -> bool:
+        """Disk tamponlarını sync ettikten sonra /proc/sys/vm/drop_caches içine 3 yazar."""
+        log_info("Dosya sistemi tamponları diske yazılıyor (sync) ve RAM önbelleği temizleniyor (drop_caches=3)...")
+        run_cmd(["sync"])
+        drop_path = Path("/proc/sys/vm/drop_caches")
+        try:
+            drop_path.write_text("3\n", encoding="utf-8")
+            self.state.set_toggle_state("mem_drop_caches", True)
+            log_info("PageCache, dentry ve inode önbellekleri başarıyla serbest bırakıldı.")
+            return True
+        except Exception as exc:
+            log_error(f"drop_caches tetiklenemedi: {exc}")
+            return False
+
+    # --- 3. /etc/fstab 'noatime' Optimizasyonu ---
+    @staticmethod
+    def is_fstab_noatime_enabled() -> Tuple[bool, str]:
+        if not FSTAB_PATH.exists():
+            return False, "/etc/fstab yok"
+        try:
+            for raw_line in FSTAB_PATH.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 4 and parts[1] == "/" and parts[2] in ("ext4", "xfs", "btrfs", "f2fs"):
+                    opts = [o.strip() for o in parts[3].split(",")]
+                    has_noatime = "noatime" in opts
+                    return has_noatime, f"Kök (/): {parts[3]}"
+        except Exception:
+            pass
+        return False, "Standart"
+
+    def set_fstab_noatime(self, enable: bool) -> None:
+        if not FSTAB_PATH.exists():
+            log_warn("/etc/fstab bulunamadı!")
+            return
+
+        if enable:
+            log_info("/etc/fstab içindeki yerel disk bölümlerine 'noatime' seçeneği ekleniyor...")
+            orig_text = FSTAB_PATH.read_text(encoding="utf-8")
+            new_lines: List[str] = []
+            modified = False
+            for raw_line in orig_text.splitlines():
+                stripped = raw_line.strip()
+                if not stripped or stripped.startswith("#"):
+                    new_lines.append(raw_line)
+                    continue
+                parts = stripped.split()
+                if len(parts) >= 4 and parts[1] == "/" and parts[2] in ("ext4", "xfs", "btrfs", "f2fs"):
+                    opts = [o.strip() for o in parts[3].split(",") if o.strip()]
+                    if "noatime" not in opts:
+                        opts = [o for o in opts if o not in ("relatime", "atime")]
+                        opts.insert(0, "noatime")
+                        parts[3] = ",".join(opts)
+                        raw_line = "\t".join(parts)
+                        modified = True
+                new_lines.append(raw_line)
+
+            if modified or str(FSTAB_PATH) not in self.state.data.get("files", {}):
+                self.state.backup_and_write_file(FSTAB_PATH, "\n".join(new_lines) + "\n", mode=0o644)
+            run_cmd(["mount", "-o", "remount,noatime", "/"])
+            self.state.set_toggle_state("storage_fstab_noatime", True)
+            log_info("Kök dosya sistemi (/) 'noatime' ile yapılandırıldı.")
+        else:
+            log_info("/etc/fstab 'noatime' ayarı yedekten geri yükleniyor...")
+            self.state.restore_file(FSTAB_PATH)
+            self.state.set_toggle_state("storage_fstab_noatime", False)
+
+    # --- 4. SSD I/O Scheduler (mq-deadline) ---
+    @classmethod
+    def get_non_rotational_schedulers(cls) -> Dict[str, str]:
+        result: Dict[str, str] = {}
+        sys_block = Path("/sys/block")
+        if not sys_block.exists():
+            return result
+
+        for dev_dir in sorted(sys_block.iterdir()):
+            name = dev_dir.name
+            if name.startswith(("loop", "ram", "sr", "dm-", "zram", "fd")):
+                continue
+            rot_file = dev_dir / "queue/rotational"
+            sched_file = dev_dir / "queue/scheduler"
+            if rot_file.exists() and sched_file.exists():
+                try:
+                    if rot_file.read_text(encoding="utf-8").strip() == "0":
+                        raw = sched_file.read_text(encoding="utf-8").strip()
+                        result[name] = cls._parse_bracketed_value(raw)
+                except Exception:
+                    continue
+        return result
+
+    def set_ssd_scheduler(self, enable: bool) -> None:
+        if enable:
+            log_info(f"SSD I/O zamanlayıcısı '{TARGET_SSD_SCHEDULER}' olarak yapılandırılıyor...")
+            current_scheds = self.get_non_rotational_schedulers()
+            for dev_name, cur_sched in current_scheds.items():
+                if dev_name not in self.state.data["ssd_schedulers"]:
+                    self.state.data["ssd_schedulers"][dev_name] = cur_sched
+
+            udev_rule_content = (
+                "# ==============================================================================\n"
+                "# Pardus 25.2 (Debian 13) SSD I/O Zamanlayıcı Optimizasyonu (mq-deadline)\n"
+                "# Dönel olmayan (rotational=0) disklerde I/O gecikmesini azaltır.\n"
+                "# ==============================================================================\n"
+                'ACTION=="add|change", KERNEL=="sd[a-z]|nvme[0-9]*n[0-9]*|vd[a-z]", '
+                'ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline"\n'
+            )
+            self.state.backup_and_write_file(UDEV_SSD_RULES_PATH, udev_rule_content, mode=0o644)
+
+            for dev_name in current_scheds:
+                sched_file = Path(f"/sys/block/{dev_name}/queue/scheduler")
+                try:
+                    raw_avail = sched_file.read_text(encoding="utf-8")
+                    if TARGET_SSD_SCHEDULER in raw_avail:
+                        sched_file.write_text(f"{TARGET_SSD_SCHEDULER}\n", encoding="utf-8")
+                        log_info(f"SSD ({dev_name}) I/O scheduler canlı olarak '{TARGET_SSD_SCHEDULER}' yapıldı.")
+                except Exception as exc:
+                    log_warn(f"SSD ({dev_name}) sysfs scheduler yazılamadı: {exc}")
+
+            if check_command_exists("udevadm"):
+                run_cmd(["udevadm", "control", "--reload-rules"])
+            self.state.set_toggle_state("storage_ssd_scheduler", True)
+        else:
+            log_info("SSD I/O Scheduler udev kuralı geri alınıyor...")
+            self.state.restore_file(UDEV_SSD_RULES_PATH)
+            for dev_name, prev_sched in list(self.state.data.get("ssd_schedulers", {}).items()):
+                sched_file = Path(f"/sys/block/{dev_name}/queue/scheduler")
+                if sched_file.exists() and prev_sched:
+                    try:
+                        sched_file.write_text(f"{prev_sched}\n", encoding="utf-8")
+                    except Exception:
+                        pass
+            self.state.data["ssd_schedulers"].clear()
+            if check_command_exists("udevadm"):
+                run_cmd(["udevadm", "control", "--reload-rules"])
+            self.state.set_toggle_state("storage_ssd_scheduler", False)
+
+    # --- 5. Intel i915 GPU Framebuffer Compression ---
+    def set_i915_fbc(self, enable: bool) -> None:
+        if enable:
+            log_info("Intel HD Graphics (i915) Framebuffer Compression (enable_fbc=1) yapılandırılıyor...")
+            i915_content = (
+                "# ==============================================================================\n"
+                "# Pardus 25.2 (Debian 13) Intel i915 Framebuffer Sıkıştırma Optimizasyonu\n"
+                "# Entegre grafik biriminin sistem RAM veriyolu yükünü hafifletir.\n"
+                "# ==============================================================================\n"
+                "options i915 enable_fbc=1\n"
+            )
+            self.state.backup_and_write_file(MODPROBE_I915_PATH, i915_content, mode=0o644)
+            i915_sysfs = Path("/sys/module/i915/parameters/enable_fbc")
+            if i915_sysfs.exists():
+                try:
+                    i915_sysfs.write_text("1\n", encoding="utf-8")
+                except Exception:
+                    pass
+            self.state.set_toggle_state("gpu_i915_fbc", True)
+        else:
+            log_info("Intel i915 modprobe yapılandırması geri yükleniyor...")
+            self.state.restore_file(MODPROBE_I915_PATH)
+            self.state.set_toggle_state("gpu_i915_fbc", False)
+
+    # --- 6. Journald Disk Boyutu Sınırı (100M / 50M) ---
+    def set_journald_limit(self, enable: bool) -> None:
+        if enable:
+            log_info("Systemd Journald disk günlük boyutu 100MB/50MB ile sınırlandırılıyor...")
+            journald_content = (
+                "# ==============================================================================\n"
+                "# Pardus 25.2 (Debian 13) SSD Yazma Ömrü İçin Journald Boyut Sınırı\n"
+                "# ==============================================================================\n"
+                "[Journal]\n"
+                "SystemMaxUse=100M\n"
+                "SystemMaxFileSize=50M\n"
+                "RuntimeMaxUse=50M\n"
+            )
+            self.state.backup_and_write_file(JOURNALD_LIMIT_CONF_PATH, journald_content, mode=0o644)
+            if check_command_exists("systemctl"):
+                run_cmd(["systemctl", "restart", "systemd-journald"])
+            if check_command_exists("journalctl"):
+                run_cmd(["journalctl", "--vacuum-size=100M"])
+            self.state.set_toggle_state("storage_journald_limit", True)
+        else:
+            log_info("Journald boyut sınırı yapılandırması geri alınıyor...")
+            self.state.restore_file(JOURNALD_LIMIT_CONF_PATH)
+            if check_command_exists("systemctl"):
+                run_cmd(["systemctl", "restart", "systemd-journald"])
+            self.state.set_toggle_state("storage_journald_limit", False)
+
+    def apply(self) -> None:
+        hw = UniversalHardwareDetector.detect()
+        self.set_thp_madvise(True)
+        self.set_fstab_noatime(True)
+        if hw.has_ssd:
+            self.set_ssd_scheduler(True)
+        else:
+            log_info("[DESTEKLENMİYOR] Sistemde SSD bulunamadı, mq-deadline kuralı atlanıyor.")
+        if hw.has_intel_gpu:
+            self.set_i915_fbc(True)
+        else:
+            log_info("[DESTEKLENMİYOR] Intel i915 GPU bulunamadı, FBC ayarı atlanıyor.")
+        self.set_journald_limit(True)
+
+    def rollback(self) -> None:
+        self.set_thp_madvise(False)
+        self.set_fstab_noatime(False)
+        self.set_ssd_scheduler(False)
+        self.set_i915_fbc(False)
+        self.set_journald_limit(False)
+        self.state.data["toggles"].clear()
+        self.state.save()
+
+
+# ==============================================================================
+# MODÜL 5: SYSTEMD SERVİS, ZAMANLAYICI VE TMPFS (/tmp) YÖNETİCİSİ
+# ==============================================================================
+
+class SystemdManager:
+    """
+    Açılış zincirini (boot chain) kilitleyen ve gereksiz kaynak tüketen servisleri
+    (plymouth-quit-wait, NetworkManager-wait-online, ModemManager, bluetooth,
+    avahi-daemon, cups, packagekit, apt-daily) tekil veya toplu olarak maskeler;
+    fstrim.timer ve tmp.mount birimlerini etkinleştirir.
+    """
+
+    def __init__(self, state: StateManager) -> None:
+        self.state = state
+
+    @staticmethod
+    def get_unit_enabled_state(unit: str) -> str:
+        if not check_command_exists("systemctl"):
+            return "BİLİNMİYOR"
+        res = run_cmd(["systemctl", "is-enabled", unit])
+        out = res.stdout.strip()
+        if out:
+            return out.splitlines()[0].strip()
+        if "No such file or directory" in res.stderr or "not-found" in res.stderr:
+            return "not-found"
+        return "BİLİNMİYOR"
+
+    @staticmethod
+    def get_unit_active_state(unit: str) -> str:
+        if not check_command_exists("systemctl"):
+            return "BİLİNMİYOR"
+        res = run_cmd(["systemctl", "is-active", unit])
+        out = res.stdout.strip()
+        return out.splitlines()[0].strip() if out else "inactive"
+
+    def _record_unit_state(self, unit: str) -> None:
+        if unit not in self.state.data["systemd_system"]:
+            enabled_state = self.get_unit_enabled_state(unit)
+            active_state = self.get_unit_active_state(unit)
+            self.state.data["systemd_system"][unit] = {
+                "enabled_state": enabled_state,
+                "active_state": active_state,
+            }
+            self.state.save()
+
+    def mask_units(self, units: List[str], toggle_id: Optional[str] = None) -> bool:
+        if not check_command_exists("systemctl"):
+            return False
+        ok = True
+        for unit in units:
+            self._record_unit_state(unit)
+            run_cmd(["systemctl", "stop", unit])
+            res = run_cmd(["systemctl", "mask", unit])
+            if res.returncode == 0:
+                log_info(f"Servis maskelendi: {unit}")
+            else:
+                ok = False
+                log_warn(f"Servis maskelenemedi ({unit}): {res.stderr.strip()}")
+        run_cmd(["systemctl", "daemon-reload"])
+        if toggle_id:
+            self.state.set_toggle_state(toggle_id, True)
+        return ok
+
+    def unmask_and_restore_units(self, units: List[str], toggle_id: Optional[str] = None) -> bool:
+        if not check_command_exists("systemctl"):
+            return False
+        saved_units: Dict[str, Dict[str, str]] = self.state.data.get("systemd_system", {})
+        for unit in units:
+            prev_info = saved_units.get(unit, {})
+            prev_enabled = prev_info.get("enabled_state", "")
+            prev_active = prev_info.get("active_state", "")
+
+            if prev_enabled != "masked":
+                run_cmd(["systemctl", "unmask", unit])
+
+            if prev_enabled in ("enabled", "enabled-runtime"):
+                run_cmd(["systemctl", "enable", unit])
+                if prev_active == "active":
+                    run_cmd(["systemctl", "start", unit])
+            elif prev_enabled == "disabled":
+                run_cmd(["systemctl", "disable", unit])
+                if prev_active != "active":
+                    run_cmd(["systemctl", "stop", unit])
+            else:
+                run_cmd(["systemctl", "unmask", unit])
+
+            if unit in self.state.data.get("systemd_system", {}):
+                del self.state.data["systemd_system"][unit]
+            log_info(f"Servis maskesi kaldırıldı ve eski durumuna döndürüldü: {unit}")
+
+        self.state.save()
+        run_cmd(["systemctl", "daemon-reload"])
+        if toggle_id:
+            self.state.set_toggle_state(toggle_id, False)
+        return True
+
+    def set_fstrim_timer(self, enable: bool) -> None:
+        if not check_command_exists("systemctl"):
+            return
+        timer = "fstrim.timer"
+        if enable:
+            self._record_unit_state(timer)
+            run_cmd(["systemctl", "unmask", timer])
+            res = run_cmd(["systemctl", "enable", "--now", timer])
+            if res.returncode == 0:
+                log_info("SSD TRIM zamanlayıcısı (fstrim.timer) etkinleştirildi.")
+            self.state.set_toggle_state("storage_fstrim", True)
+        else:
+            self.unmask_and_restore_units([timer], toggle_id="storage_fstrim")
+
+    def set_tmpfs_mount(self, enable: bool) -> None:
+        if not check_command_exists("systemctl"):
+            return
+        wants_dir = Path("/etc/systemd/system/local-fs.target.wants")
+        link_path = wants_dir / TMPFS_MOUNT_UNIT
+        unit_src = Path("/usr/lib/systemd/system/tmp.mount")
+
+        if enable:
+            hw = UniversalHardwareDetector.detect()
+            log_info(f"Geçici dosyaları {hw.ram_total_gb:.1f} GB RAM üzerinde tutmak için '{TMPFS_MOUNT_UNIT}' etkinleştiriliyor...")
+            self._record_unit_state(TMPFS_MOUNT_UNIT)
+            run_cmd(["systemctl", "unmask", TMPFS_MOUNT_UNIT])
+            run_cmd(["systemctl", "enable", TMPFS_MOUNT_UNIT])
+            if unit_src.exists():
+                try:
+                    wants_dir.mkdir(parents=True, exist_ok=True)
+                    if not link_path.exists() and not link_path.is_symlink():
+                        link_path.symlink_to(unit_src)
+                except Exception:
+                    pass
+            run_cmd(["systemctl", "start", TMPFS_MOUNT_UNIT])
+            self.state.set_toggle_state("mem_tmpfs_tmp", True)
+            log_info(f"'{TMPFS_MOUNT_UNIT}' (tmpfs /tmp) başarıyla etkinleştirildi.")
+        else:
+            tmp_prev = self.state.data.get("systemd_system", {}).get(TMPFS_MOUNT_UNIT, {}).get("enabled_state", "")
+            if tmp_prev not in ("enabled", "enabled-runtime") and link_path.is_symlink():
+                try:
+                    link_path.unlink()
+                except Exception:
+                    pass
+            if TMPFS_MOUNT_UNIT in self.state.data.get("systemd_system", {}):
+                del self.state.data["systemd_system"][TMPFS_MOUNT_UNIT]
+            self.state.set_toggle_state("mem_tmpfs_tmp", False)
+            log_info(f"'{TMPFS_MOUNT_UNIT}' başlangıç bağlantısı varsayılana döndürüldü.")
+        run_cmd(["systemctl", "daemon-reload"])
+
+    def apply(self) -> None:
+        self.mask_units(SERVICES_TO_MASK)
+        self.set_fstrim_timer(True)
+        self.set_tmpfs_mount(True)
+
+    def rollback(self) -> None:
+        if not check_command_exists("systemctl"):
+            return
+        log_info("Systemd servis, zamanlayıcı ve tmp.mount durumları geri yükleniyor...")
+        self.set_tmpfs_mount(False)
+        saved_units = list(self.state.data.get("systemd_system", {}).keys())
+        all_units = list(set(SERVICES_TO_MASK + TIMERS_TO_ENABLE + saved_units))
+        self.unmask_and_restore_units(all_units)
+        self.state.data["systemd_system"].clear()
+        self.state.save()
+
+
+# ==============================================================================
+# MODÜL 6: GNOME VE TRACKER İNDEKSLEYİCİ AYARLAYICI
+# ==============================================================================
+
+class GnomeTuner:
+    """
+    Masaüstü kullanıcısının oturumu üzerinden GNOME animasyonlarını kapatır
+    ve Tracker3 / LocalSearch indeksleyicisini susturur.
+    """
+
+    def __init__(self, state: StateManager, user_info: Optional[pwd.struct_passwd]) -> None:
+        self.state = state
+        self.user_info = user_info
+
+    def get_available_schemas(self) -> List[str]:
+        if not self.user_info or not check_command_exists("gsettings"):
+            return []
+        res = run_as_desktop_user(self.user_info, ["gsettings", "list-schemas"])
+        if res.returncode == 0:
+            return [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        return []
+
+    def get_gsettings_value(self, schema: str, key: str) -> str:
+        if not self.user_info or not check_command_exists("gsettings"):
+            return "YOK"
+        res = run_as_desktop_user(self.user_info, ["gsettings", "get", schema, key])
+        if res.returncode == 0:
+            return res.stdout.strip()
+        return "DESTEKLENMİYOR"
+
+    def get_user_unit_enabled(self, unit: str) -> str:
+        if not self.user_info or not check_command_exists("systemctl"):
+            return "BİLİNMİYOR"
+        res = run_as_desktop_user(self.user_info, ["systemctl", "--user", "is-enabled", unit])
+        out = res.stdout.strip()
+        if out:
+            return out.splitlines()[0].strip()
+        user_mask_link = Path(self.user_info.pw_dir) / ".config/systemd/user" / unit
+        if user_mask_link.is_symlink() and os.readlink(user_mask_link) == "/dev/null":
+            return "masked"
+        return "not-found"
+
+    def _mask_user_service_fallback(self, unit: str, mask: bool) -> None:
+        if not self.user_info:
+            return
+        user_systemd_dir = Path(self.user_info.pw_dir) / ".config/systemd/user"
+        target_link = user_systemd_dir / unit
+
+        try:
+            if mask:
+                user_systemd_dir.mkdir(parents=True, exist_ok=True)
+                for parent in [
+                    Path(self.user_info.pw_dir) / ".config",
+                    Path(self.user_info.pw_dir) / ".config/systemd",
+                    user_systemd_dir,
+                ]:
+                    if parent.exists():
+                        os.chown(parent, self.user_info.pw_uid, self.user_info.pw_gid)
+                if target_link.exists() or target_link.is_symlink():
+                    target_link.unlink()
+                target_link.symlink_to("/dev/null")
+                os.lchown(target_link, self.user_info.pw_uid, self.user_info.pw_gid)
+            else:
+                if target_link.is_symlink() and os.readlink(target_link) == "/dev/null":
+                    target_link.unlink()
+        except Exception as exc:
+            log_warn(f"Kullanıcı servisi sembolik bağ işleminde uyarı ({unit}): {exc}")
+
+    def set_animations_disabled(self, disable_anim: bool) -> None:
+        """GNOME masaüstü animasyonlarını (enable-animations) kapatır veya açar."""
+        if not self.user_info or not check_command_exists("gsettings"):
+            log_warn("Masaüstü kullanıcısı veya 'gsettings' bulunamadı!")
+            return
+        schema = "org.gnome.desktop.interface"
+        key = "enable-animations"
+        state_key = f"{schema}:{key}"
+
+        if disable_anim:
+            cur_val = self.get_gsettings_value(schema, key)
+            if cur_val not in ("YOK", "DESTEKLENMİYOR") and state_key not in self.state.data["gsettings"]:
+                self.state.data["gsettings"][state_key] = cur_val
+            res = run_as_desktop_user(self.user_info, ["gsettings", "set", schema, key, "false"])
+            if res.returncode == 0:
+                log_info("GNOME pencere ve çalışma alanı animasyonları kapatıldı (enable-animations=false).")
+            self.state.set_toggle_state("gpu_gnome_animations", True)
+        else:
+            prev_val = self.state.data.get("gsettings", {}).pop(state_key, "true")
+            run_as_desktop_user(self.user_info, ["gsettings", "set", schema, key, prev_val])
+            log_info(f"GNOME animasyonları geri açıldı (enable-animations={prev_val}).")
+            self.state.set_toggle_state("gpu_gnome_animations", False)
+
+    def apply(self) -> None:
+        if not self.user_info:
+            log_warn("Standart masaüstü kullanıcısı tespit edilemedi! GNOME ayarları atlanıyor.")
+            return
+
+        username = self.user_info.pw_name
+        self.state.data["metadata"]["target_user"] = username
+        log_info(f"GNOME ve Tracker optimizasyonları '{username}' kullanıcısı için uygulanıyor...")
+
+        if check_command_exists("gsettings"):
+            schemas = set(self.get_available_schemas())
+            for schema, key, target_val in GNOME_GSETTINGS_TARGETS:
+                if schemas and schema not in schemas:
+                    continue
+                state_key = f"{schema}:{key}"
+                cur_val = self.get_gsettings_value(schema, key)
+                if cur_val not in ("YOK", "DESTEKLENMİYOR"):
+                    if state_key not in self.state.data["gsettings"]:
+                        self.state.data["gsettings"][state_key] = cur_val
+                    res = run_as_desktop_user(self.user_info, ["gsettings", "set", schema, key, target_val])
+                    if res.returncode == 0:
+                        log_info(f"gsettings uygulandı: {schema} {key} = {target_val}")
+
+        for unit in USER_SERVICES_TO_MASK:
+            if unit not in self.state.data["systemd_user"]:
+                self.state.data["systemd_user"][unit] = self.get_user_unit_enabled(unit)
+            res = run_as_desktop_user(self.user_info, ["systemctl", "--user", "mask", "--now", unit])
+            if res.returncode != 0:
+                self._mask_user_service_fallback(unit, mask=True)
+            log_info(f"Kullanıcı indeksleyici servisi susturuldu: {unit}")
+
+        if check_command_exists("tracker3"):
+            run_as_desktop_user(self.user_info, ["tracker3", "daemon", "-k"])
+        if check_command_exists("localsearch"):
+            run_as_desktop_user(self.user_info, ["localsearch", "daemon", "-k"])
+
+        self.state.set_toggle_state("gpu_gnome_animations", True)
+        self.state.save()
+
+    def rollback(self) -> None:
+        if not self.user_info:
+            return
+        username = self.user_info.pw_name
+        log_info(f"GNOME ve Tracker ayarları '{username}' kullanıcısı için geri yükleniyor...")
+
+        if check_command_exists("gsettings"):
+            for state_key, prev_val in list(self.state.data.get("gsettings", {}).items()):
+                if ":" in state_key:
+                    schema, key = state_key.split(":", 1)
+                    res = run_as_desktop_user(self.user_info, ["gsettings", "set", schema, key, prev_val])
+                    if res.returncode != 0:
+                        run_as_desktop_user(self.user_info, ["gsettings", "reset", schema, key])
+                del self.state.data["gsettings"][state_key]
+
+        for unit in USER_SERVICES_TO_MASK:
+            prev_state = self.state.data.get("systemd_user", {}).get(unit, "")
+            if prev_state != "masked":
+                self._mask_user_service_fallback(unit, mask=False)
+                run_as_desktop_user(self.user_info, ["systemctl", "--user", "unmask", unit])
+                log_info(f"Kullanıcı servisi maskesi kaldırıldı: {unit}")
+
+        self.state.data["systemd_user"].clear()
+        self.state.set_toggle_state("gpu_gnome_animations", False)
+        self.state.save()
+
+
+# ==============================================================================
+# MODÜL 7: CURSES TUI CHECKLIST PAKET TEMİZLEME MODÜLÜ (SYSTEM DEBLOATER)
+# ==============================================================================
+
+class SystemDebloater:
+    """
+    Sistemde kurulu olan gereksiz masaüstü paketlerini tespit eder.
+    'apt-get purge --simulate' çıktısını denetleyerek kritik sistem paketlerine
+    zarar verecek işlemleri VETO eder.
+    """
+
+    def __init__(self, state: StateManager) -> None:
+        self.state = state
+
+    @staticmethod
+    def _format_size_kb(size_kb_str: str) -> str:
+        try:
+            kb = int(size_kb_str.strip())
+            if kb >= 1024:
+                return f"{kb / 1024.0:.1f} MB"
+            return f"{kb} KB"
+        except (ValueError, TypeError):
+            return "Bilinmeyen Boyut"
+
+    def scan_installed_candidates(self) -> List[Tuple[str, str, str]]:
+        if not check_command_exists("dpkg-query"):
+            log_error("'dpkg-query' aracı bulunamadı! Paket taraması yapılamıyor.")
+            return []
+
+        installed_list: List[Tuple[str, str, str]] = []
+        res = run_cmd(
+            [
+                "dpkg-query",
+                "-W",
+                "-f=${db:Status-Abbrev}\\t${Package}\\t${Installed-Size}\\t${binary:Summary}\\n",
+            ],
+            timeout=30,
+        )
+        if res.returncode != 0 and not res.stdout:
+            return []
+
+        installed_map: Dict[str, Tuple[str, str]] = {}
+        for line in res.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                status_abbrev = parts[0].strip()
+                pkg_name = parts[1].strip().split(":")[0]
+                size_kb = parts[2].strip()
+                summary = parts[3].strip() if len(parts) >= 4 else ""
+                if status_abbrev.startswith("ii"):
+                    installed_map[pkg_name] = (size_kb, summary)
+
+        for candidate_pkg, tr_desc in DEBLOAT_CANDIDATES.items():
+            if candidate_pkg in installed_map:
+                size_kb, dpkg_summary = installed_map[candidate_pkg]
+                desc = tr_desc if tr_desc else (dpkg_summary or "Gereksiz masaüstü paketi")
+                size_str = self._format_size_kb(size_kb)
+                installed_list.append((candidate_pkg, desc, size_str))
+
+        return installed_list
+
+    @staticmethod
+    def _is_critical_package(pkg_name: str) -> bool:
+        clean_name = pkg_name.strip().split(":")[0].rstrip("*")
+        if clean_name in CRITICAL_PROTECTED_PACKAGES:
+            return True
+        for prefix in CRITICAL_PROTECTED_PREFIXES:
+            if clean_name.startswith(prefix):
+                return True
+        return False
+
+    def simulate_and_validate_purge(self, package_name: str) -> Tuple[bool, List[str], str]:
+        if not check_command_exists("apt-get"):
+            return False, [], "'apt-get' komutu sistemde bulunamadı."
+
+        sim_env = os.environ.copy()
+        sim_env["LC_ALL"] = "C"
+        sim_env["LANG"] = "C"
+        sim_env["DEBIAN_FRONTEND"] = "noninteractive"
+
+        res = run_cmd(
+            ["apt-get", "purge", "--simulate", package_name],
+            env=sim_env,
+            timeout=60,
+        )
+        if res.returncode != 0:
+            err_detail = res.stderr.strip() or res.stdout.strip()
+            return False, [], f"Simülasyon komutu başarısız oldu: {err_detail}"
+
+        to_be_removed: List[str] = []
+        in_removed_block = False
+
+        for raw_line in res.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if line.startswith("Purg ") or line.startswith("Remv "):
+                parts = line.split()
+                if len(parts) >= 2:
+                    pkg = parts[1].strip().split(":")[0]
+                    if pkg not in to_be_removed:
+                        to_be_removed.append(pkg)
+
+            if line.startswith("The following packages will be REMOVED:"):
+                in_removed_block = True
+                continue
+            if in_removed_block:
+                if raw_line.startswith("  "):
+                    for token in line.split():
+                        pkg = token.rstrip("*").split(":")[0]
+                        if pkg and pkg not in to_be_removed:
+                            to_be_removed.append(pkg)
+                else:
+                    in_removed_block = False
+
+        violated_criticals: List[str] = [
+            pkg for pkg in to_be_removed if self._is_critical_package(pkg)
+        ]
+
+        if violated_criticals:
+            return (
+                False,
+                violated_criticals,
+                (
+                    f"VETO EDİLDİ! '{package_name}' paketinin kaldırılması kritik sistem "
+                    f"bileşenlerini ({', '.join(violated_criticals)}) sileceği için işlem engellendi."
+                ),
+            )
+
+        return True, to_be_removed, "Simülasyon güvenli."
+
+    def purge_selected_packages(self, selected_packages: List[str]) -> Tuple[int, int]:
+        apt_env = os.environ.copy()
+        apt_env["DEBIAN_FRONTEND"] = "noninteractive"
+
+        removed_count = 0
+        vetoed_count = 0
+
+        for pkg_name in selected_packages:
+            log_info(f"'{pkg_name}' için bağımlılık güvenliği simülasyonu çalıştırılıyor (apt-get purge --simulate)...")
+            is_safe, affected_list, message = self.simulate_and_validate_purge(pkg_name)
+
+            if not is_safe:
+                vetoed_count += 1
+                log_warn(message)
+                continue
+
+            log_info(f"Simülasyon doğrulandı (Etkilenen paket: {len(affected_list)}). '{pkg_name}' kaldırılıyor...")
+            purge_res = run_cmd(
+                ["apt-get", "purge", "-y", pkg_name],
+                env=apt_env,
+                timeout=300,
+            )
+            if purge_res.returncode == 0:
+                log_info(f"Paket başarıyla kaldırıldı: {pkg_name}")
+                self.state.record_removed_package(pkg_name)
+                removed_count += 1
+
+                log_info("Artık bağımlılıklar temizleniyor (apt-get autoremove -y)...")
+                run_cmd(["apt-get", "autoremove", "-y"], env=apt_env, timeout=300)
+            else:
+                log_error(f"'{pkg_name}' kaldırılırken hata oluştu: {purge_res.stderr.strip()}")
+
+        log_info(
+            f"Debloat İşlemi Tamamlandı -> "
+            f"Seçilen: {len(selected_packages)} | Kaldırılan: {removed_count} | Veto Edilen: {vetoed_count}"
+        )
+        return removed_count, vetoed_count
+
+    @staticmethod
+    def _safe_addstr(win: Any, y: int, x: int, text: str, attr: int = 0) -> None:
+        try:
+            max_y, max_x = win.getmaxyx()
+            if y < 0 or y >= max_y or x < 0 or x >= max_x:
+                return
+            avail = max_x - x - 1
+            if avail <= 0:
+                return
+            win.addstr(y, x, text[:avail], attr)
+        except curses.error:
+            pass
+
+    def _curses_checklist_loop(
+        self,
+        stdscr: Any,
+        candidates: List[Tuple[str, str, str]],
+    ) -> Optional[List[str]]:
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
+        if hasattr(curses, "set_escdelay"):
+            try:
+                curses.set_escdelay(25)
+            except curses.error:
+                pass
+
+        stdscr.keypad(True)
+
+        color_header = curses.A_BOLD
+        color_selected = curses.A_BOLD
+        color_unselected = curses.A_NORMAL
+        color_status = curses.A_REVERSE | curses.A_BOLD
+
+        try:
+            if curses.has_colors():
+                curses.start_color()
+                curses.use_default_colors()
+                curses.init_pair(1, curses.COLOR_CYAN, -1)
+                curses.init_pair(2, curses.COLOR_GREEN, -1)
+                curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_BLUE)
+                curses.init_pair(4, curses.COLOR_YELLOW, -1)
+                color_header = curses.color_pair(1) | curses.A_BOLD
+                color_selected = curses.color_pair(2) | curses.A_BOLD
+                color_unselected = curses.A_NORMAL
+                color_status = curses.color_pair(3) | curses.A_BOLD
+        except curses.error:
+            pass
+
+        selected_indices: Set[int] = set()
+        cursor_idx = 0
+        scroll_offset = 0
+        total_items = len(candidates)
+
+        while True:
+            stdscr.erase()
+            max_y, max_x = stdscr.getmaxyx()
+
+            if max_y < 10 or max_x < 45:
+                self._safe_addstr(
+                    stdscr,
+                    0,
+                    0,
+                    "Terminal penceresi çok küçük! Lütfen büyütün (Min: 45x10).",
+                    curses.A_BOLD,
+                )
+                stdscr.refresh()
+                ch = stdscr.getch()
+                if ch in (ord("q"), ord("Q"), 27):
+                    return None
+                continue
+
+            hw = UniversalHardwareDetector.detect()
+            top_border = "┌" + "─" * max(0, max_x - 3) + "┐"
+            bottom_border = "└" + "─" * max(0, max_x - 3) + "┘"
+            title_text = "PARDUS 25.2 (DEBIAN 13) PAKET TEMİZLEME VE DEBLOAT TUI SİHİRBAZI"
+            hw_text = f"Donanım Özeti: {hw.short_summary()}"
+            summary_text = (
+                f"Kurulu Aday Paket: {total_items} | "
+                f"Seçilen: {len(selected_indices)} | "
+                f"Güvenlik: apt-get purge --simulate (Aktif)"
+            )
+
+            self._safe_addstr(stdscr, 0, 0, top_border, color_header)
+            self._safe_addstr(stdscr, 1, 0, f"│ {title_text.center(max(0, max_x - 5))} │", color_header)
+            self._safe_addstr(stdscr, 2, 0, f"│ {hw_text.center(max(0, max_x - 5))} │", color_header)
+            self._safe_addstr(stdscr, 3, 0, f"│ {summary_text.center(max(0, max_x - 5))} │", color_header)
+            self._safe_addstr(stdscr, 4, 0, bottom_border, color_header)
+
+            list_start_y = 5
+            list_end_y = max_y - 2
+            viewport_height = max(1, list_end_y - list_start_y)
+
+            if cursor_idx < scroll_offset:
+                scroll_offset = cursor_idx
+            elif cursor_idx >= scroll_offset + viewport_height:
+                scroll_offset = cursor_idx - viewport_height + 1
+
+            for vis_row in range(viewport_height):
+                item_idx = scroll_offset + vis_row
+                if item_idx >= total_items:
+                    break
+
+                pkg_name, desc, size_str = candidates[item_idx]
+                is_checked = item_idx in selected_indices
+                is_cursor = item_idx == cursor_idx
+
+                marker = "[*]" if is_checked else "[ ]"
+                line_str = f" {marker} {pkg_name} ({size_str}) - {desc}"
+                padded_line = line_str.ljust(max(0, max_x - 2))
+
+                attr = color_selected if is_checked else color_unselected
+                if is_cursor:
+                    attr |= curses.A_REVERSE
+
+                self._safe_addstr(stdscr, list_start_y + vis_row, 0, padded_line, attr)
+
+            status_bar_text = (
+                " [↑/↓] Gezin | [Space] Seç/Bırak | [A] Tümü | [Enter] Uygula | [Q] Çıkış "
+            )
+            padded_status = status_bar_text.ljust(max(0, max_x - 1))
+            self._safe_addstr(stdscr, max_y - 1, 0, padded_status, color_status)
+
+            stdscr.refresh()
+
+            ch = stdscr.getch()
+
+            if ch == curses.KEY_RESIZE:
+                try:
+                    curses.update_lines_cols()
+                except Exception:
+                    pass
+                continue
+
+            if ch == curses.KEY_UP:
+                cursor_idx = (cursor_idx - 1) % total_items
+            elif ch == curses.KEY_DOWN:
+                cursor_idx = (cursor_idx + 1) % total_items
+            elif ch == ord(" "):
+                if cursor_idx in selected_indices:
+                    selected_indices.remove(cursor_idx)
+                else:
+                    selected_indices.add(cursor_idx)
+            elif ch in (ord("a"), ord("A")):
+                if len(selected_indices) == total_items:
+                    selected_indices.clear()
+                else:
+                    selected_indices = set(range(total_items))
+            elif ch in (10, 13, curses.KEY_ENTER):
+                return [candidates[i][0] for i in sorted(selected_indices)]
+            elif ch in (ord("q"), ord("Q"), 27):
+                return None
+
+    def run_wizard(self) -> None:
+        candidates = self.scan_installed_candidates()
+        if not candidates:
+            log_info("Sistemde kaldırılacak gereksiz (bloatware) paket bulunamadı. Sisteminiz temiz!")
+            return
+
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            log_error("Etkileşimli TUI arayüzü için aktif bir terminal (TTY) gereklidir.")
+            return
+
+        locale.setlocale(locale.LC_ALL, "")
+        os.environ.setdefault("ESCDELAY", "25")
+
+        try:
+            selected_packages = curses.wrapper(self._curses_checklist_loop, candidates)
+        except Exception as exc:
+            log_error(f"Curses TUI arayüzü çalıştırılırken hata oluştu: {exc}")
+            return
+
+        if not selected_packages:
+            log_info("Paket seçimi yapılmadı veya işlem iptal edildi.")
+            return
+
+        self.purge_selected_packages(selected_packages)
+
+    def rollback(self) -> None:
+        removed_pkgs: List[str] = list(self.state.data.get("removed_packages", []))
+        if not removed_pkgs:
+            log_info("Manifestoda daha önce kaldırılmış paket kaydı ('removed_packages') bulunmuyor.")
+            return
+
+        if not check_command_exists("apt-get"):
+            log_error("'apt-get' bulunamadığı için kaldırılan paketler geri yüklenemedi!")
+            return
+
+        log_info(f"Daha önce kaldırılan {len(removed_pkgs)} paket sisteme geri yükleniyor: {', '.join(removed_pkgs)}")
+        apt_env = os.environ.copy()
+        apt_env["DEBIAN_FRONTEND"] = "noninteractive"
+
+        still_missing: List[str] = []
+        for pkg_name in removed_pkgs:
+            log_info(f"Paket yeniden kuruluyor: {pkg_name} ...")
+            res = run_cmd(
+                ["apt-get", "install", "-y", pkg_name],
+                env=apt_env,
+                timeout=300,
+            )
+            if res.returncode == 0:
+                log_info(f"Paket başarıyla geri yüklendi: {pkg_name}")
+            else:
+                log_error(f"Paket geri yüklenemedi ({pkg_name}): {res.stderr.strip()}")
+                still_missing.append(pkg_name)
+
+        self.state.data["removed_packages"] = still_missing
+        self.state.save()
+
+
+# ==============================================================================
+# MODÜL 8: GRANÜLER AYAR ENVANTERİ VE DETAY MOTORU (SPLIT-VIEW KAYNAĞI)
+# ==============================================================================
+
+@dataclasses.dataclass
+class TuningOption:
+    """
+    Split-View TUI Sol Panelde listelenen ve Sağ Panelde İşlev / Donanıma Etkisi /
+    Risk & Yan Etki analizleri gösterilen tekil (granular) sistem ayarı.
+    """
+
+    option_id: str
+    category: str
+    title: str
+    target_summary: str
+    func_desc: str
+    hw_impact: str
+    risk_side_effect: str
+    check_fn: Callable[[], Tuple[bool, str]]
+    toggle_fn: Callable[[bool], None]
+    is_one_shot: bool = False
+    supported: bool = True
+    unsupported_reason: str = ""
+
+
+class GranularTuningRegistry:
+    """
+    Evrensel donanım profiline göre granüler overclock, güç kilidi, bellek,
+    depolama, işlemci, grafik, ağ ve servis ayarlarını durum sorgulama,
+    donanım uyumluluk filtresi ([DESTEKLENMİYOR]) ve tekil Aç/Kapa (Toggle)
+    işlevleriyle birlikte üretir.
+    """
+
+    def __init__(self, state: StateManager, user_info: Optional[pwd.struct_passwd]) -> None:
+        self.state = state
+        self.user_info = user_info
+        self.hw = UniversalHardwareDetector.detect()
+        self.sysctl = SysctlTuner(state)
+        self.cpu = CpuGovernorManager(state)
+        self.hw_power = HardwarePowerTuner(state)
+        self.storage = StorageAndKernelTuner(state)
+        self.systemd = SystemdManager(state)
+        self.gnome = GnomeTuner(state, user_info)
+
+    def build_options(self) -> List[TuningOption]:
+        hw = self.hw
+        gpu_max = hw.gpu_max_boost_mhz
+        opts: List[TuningOption] = [
+            # ---------------- OVERCLOCK & GÜÇ KİLİDİ (HARDWARE POWER UNCAP) ----------------
+            TuningOption(
+                option_id="oc_gpu_boost_1050",
+                category="OVERCLOCK & GÜÇ KİLİDİ",
+                title=f"GPU Overclock / Saat Kilitleme ({gpu_max} MHz)",
+                target_summary=f"gt_min_freq_mhz & gt_boost_freq_mhz = {gpu_max} MHz",
+                func_desc=(
+                    "'/sys/class/drm/card0/gt_min_freq_mhz' ve 'gt_boost_freq_mhz' değerlerini "
+                    f"grafik biriminin ({hw.gpu_model}) izin verdiği en tepe dinamik "
+                    f"frekansa ({gpu_max} MHz) kilitler ve '/etc/tmpfiles.d/pardus-gpu-oc.conf' ile kalıcı yapar."
+                ),
+                hw_impact=(
+                    f"{hw.gpu_model} ({hw.gpu_driver}) biriminin taban saat hızına düşmesini "
+                    "engelleyerek pencere çizimi, WebGL, video çözme ve masaüstü kompozitör "
+                    "kare hızlarını (FPS) kesintisiz en üst seviyede tutar."
+                ),
+                risk_side_effect=(
+                    f"Grafik birimi sürekli {gpu_max} MHz tavan saat hızında çalışır; paket sıcaklığını "
+                    "2-4°C artırabilir. Tek tuşla varsayılan taban değerine geri döndürülebilir."
+                ),
+                check_fn=HardwarePowerTuner.get_gpu_boost_status,
+                toggle_fn=self.hw_power.set_gpu_boost,
+                supported=hw.has_intel_gpu_boost,
+                unsupported_reason="Intel i915 dinamik GPU frekans düğümü (/sys/class/drm/card0/gt_min_freq_mhz) bulunamadı.",
+            ),
+            TuningOption(
+                option_id="oc_cpu_epb_perf",
+                category="OVERCLOCK & GÜÇ KİLİDİ",
+                title="Intel EPB (Energy-Performance Bias -> 0)",
+                target_summary="cpu*/power/energy_perf_bias = 0 (performance)",
+                func_desc=(
+                    "'/sys/devices/system/cpu/cpu*/power/energy_perf_bias' düğümleri üzerinden "
+                    "işlemci donanım enerji-performans eğilim kaydını (MSR_IA32_ENERGY_PERF_BIAS) "
+                    "'6' (normal) yerine '0' (performance) seviyesine çeker."
+                ),
+                hw_impact=(
+                    f"{hw.cpu_model} güç kontrol birimine (PCU) enerji tasarrufu yerine saf hesaplama "
+                    "hızını ve anlık voltaj/saat tepkiselliğini önceliklendirme talimatı verir."
+                ),
+                risk_side_effect=(
+                    "Düşük risk. Yalnızca donanım içi güç-performans ağırlığını maksimum performansa "
+                    "ayarlar; işlemci tasarım limitleri (TDP) içinde güvenle çalışır."
+                ),
+                check_fn=HardwarePowerTuner.get_epb_status,
+                toggle_fn=self.hw_power.set_epb_performance,
+                supported=hw.has_intel_epb,
+                unsupported_reason=f"Bu ayar yalnızca Intel EPB destekli işlemcilerde çalışır (Mevcut: {hw.cpu_vendor}).",
+            ),
+            TuningOption(
+                option_id="oc_rapl_35w",
+                category="OVERCLOCK & GÜÇ KİLİDİ",
+                title="Intel RAPL Güç Sınırı Tavanı (PL1/PL2 35W)",
+                target_summary="intel-rapl constraint_0_power_limit_uw = 35000000 (35W)",
+                func_desc=(
+                    "'/sys/class/powercap/intel-rapl' düğümlerinde uzun süreli (PL1) ve kısa süreli (PL2) "
+                    "paket güç sınırlarını 35W (35.000.000 uW) tavanına sabitleyerek erken OEM güç/termal "
+                    "kısmasını (throttling) geciktirir."
+                ),
+                hw_impact=(
+                    f"{hw.cpu_model} ve {hw.gpu_model} aynı anda %100 yüke "
+                    "girdiğinde (CPU+GPU ortak yükü) güç bütçesi daralması nedeniyle saat hızı "
+                    "düşürülmesini önler."
+                ),
+                risk_side_effect=(
+                    "35W değeri standart mobil/masaüstü TDP tavanıdır; soğutucu fanın temiz "
+                    "olduğu sistemlerde güvenlidir."
+                ),
+                check_fn=HardwarePowerTuner.get_rapl_status,
+                toggle_fn=self.hw_power.set_rapl_power_limit,
+                supported=hw.has_intel_rapl,
+                unsupported_reason="Intel RAPL powercap arayüzü (/sys/class/powercap/intel-rapl) bu donanımda bulunamadı.",
+            ),
+            TuningOption(
+                option_id="cpu_cstate_latency",
+                category="OVERCLOCK & GÜÇ KİLİDİ",
+                title="C-State Düşük Gecikme Modu (C3/C6 Engelleme)",
+                target_summary="cpuidle C3/C6 (state3+) disable = 1",
+                func_desc=(
+                    "İşlemcinin yüksek uyanma gecikmeli derin uyku modlarını (C3/C6 / state3+) "
+                    "devre dışı bırakarak çekirdeklerin her an uyanık kalmasını sağlar."
+                ),
+                hw_impact=(
+                    f"{hw.cpu_model} ({hw.cpu_cores} çekirdek) üzerinde L2/L3 önbellek boşaltma ve "
+                    "derin uykudan uyanma gecikmelerini (exit latency) sıfırlayarak masaüstü "
+                    "tepkiselliğini en üst seviyeye taşır."
+                ),
+                risk_side_effect=(
+                    "Boşta güç tüketimini ve sıcaklığı birkaç derece artırabilir; C1/C1E hafif "
+                    "bekleme modları korunur."
+                ),
+                check_fn=CpuGovernorManager.is_cstate_latency_optimized,
+                toggle_fn=self.cpu.set_cstate_latency,
+                supported=hw.has_deep_cstate,
+                unsupported_reason="İşlemcide cpuidle derin uyku (C3/C6 / state3+) kontrol düğümü bulunamadı.",
+            ),
+            # ---------------- BELLEK (MEMORY) ----------------
+            TuningOption(
+                option_id="mem_swappiness",
+                category="BELLEK",
+                title="vm.swappiness (10)",
+                target_summary="vm.swappiness = 10",
+                func_desc=(
+                    "Linux çekirdeğinin fiziksel RAM'deki anonim bellek sayfalarını ne kadar "
+                    "agresif biçimde disk üzerindeki takas (swap) alanına taşıyacağını belirler. "
+                    "Varsayılan değer 60'tır; 10 değeri çekirdeğe RAM dolana kadar takastan kaçınmasını emreder."
+                ),
+                hw_impact=(
+                    f"Sistemdeki {hw.ram_total_gb:.1f} GB RAM kapasitesini verimli kullanarak "
+                    f"{hw.cpu_model} işlemcinin gereksiz kswapd (sayfa takası) kesmeleriyle "
+                    "yavaşlamasını önler ve disk yazma ömrünü korur."
+                ),
+                risk_side_effect=(
+                    "Çok düşük risk. Bellek kullanımı %90 seviyesine ulaşmadıkça swap kullanılmaz; "
+                    "OOM (Out-of-Memory) tehlikesi oluşturmaz."
+                ),
+                check_fn=lambda: (
+                    SysctlTuner.get_current_value("vm.swappiness") == "10",
+                    f"vm.swappiness={SysctlTuner.get_current_value('vm.swappiness')}",
+                ),
+                toggle_fn=lambda en: self._toggle_sysctl("mem_swappiness", "vm.swappiness", "10", "60", en),
+            ),
+            TuningOption(
+                option_id="mem_vfs_cache",
+                category="BELLEK",
+                title="vm.vfs_cache_pressure (50)",
+                target_summary="vm.vfs_cache_pressure = 50",
+                func_desc=(
+                    "Dizin (dentry) ve dosya üstverisi (inode) önbelleklerinin RAM'den geri "
+                    "kazanılma hızını kontrol eder. 100 olan varsayılan değer yerine 50 seçildiğinde "
+                    "dosya sistemi yapısı RAM'de daha uzun süre tutulur."
+                ),
+                hw_impact=(
+                    f"{hw.ram_total_gb:.1f} GB RAM'in boş kapasitesini dosya dizin ağacını önbelleklemek için kullanır. "
+                    f"{hw.cpu_model} üzerinde dosya yöneticisi, uygulama başlatma ve "
+                    "paket arama işlemlerinde diske gitmeden anında yanıt alınmasını sağlar."
+                ),
+                risk_side_effect=(
+                    "Düşük risk. Dosya sistemi önbelleği RAM'de biraz daha fazla yer kaplar ancak "
+                    "uygulamalar bellek istediğinde çekirdek tarafından anında serbest bırakılır."
+                ),
+                check_fn=lambda: (
+                    SysctlTuner.get_current_value("vm.vfs_cache_pressure") == "50",
+                    f"vfs_cache_pressure={SysctlTuner.get_current_value('vm.vfs_cache_pressure')}",
+                ),
+                toggle_fn=lambda en: self._toggle_sysctl("mem_vfs_cache", "vm.vfs_cache_pressure", "50", "100", en),
+            ),
+            TuningOption(
+                option_id="mem_thp_madvise",
+                category="BELLEK",
+                title="THP (Transparent Hugepages -> madvise)",
+                target_summary="THP = madvise (Kalıcı)",
+                func_desc=(
+                    "2 MB boyutundaki dev bellek sayfalarının (Hugepages) tüm süreçlere zorla "
+                    "('always') atanması yerine, yalnızca MADV_HUGEPAGE ile açıkça talep eden "
+                    "uygulamalara ('madvise') tahsis edilmesini sağlar."
+                ),
+                hw_impact=(
+                    f"{hw.cpu_model} ({hw.cpu_cores} çekirdek) üzerinde arka planda çalışan "
+                    "khugepaged birleştirme (defrag) işleminin neden olduğu anlık CPU dikenlerini "
+                    f"(latency spikes) ve {hw.ram_total_gb:.1f} GB RAM'deki bellek şişmesini engeller."
+                ),
+                risk_side_effect=(
+                    "Güvenli ve Debian/Pardus için önerilen moddur. Tüm standart masaüstü uygulamalarıyla "
+                    "tam uyumludur."
+                ),
+                check_fn=StorageAndKernelTuner.get_thp_status,
+                toggle_fn=self.storage.set_thp_madvise,
+                supported=StorageAndKernelTuner.THP_ENABLED_PATH.exists(),
+                unsupported_reason="Çekirdekte Transparent Hugepages (THP) sysfs düğümü bulunamadı.",
+            ),
+            TuningOption(
+                option_id="mem_drop_caches",
+                category="BELLEK",
+                title="RAM Önbellek Temizleyici (drop_caches=3)",
+                target_summary="sync && echo 3 > /proc/sys/vm/drop_caches",
+                func_desc=(
+                    "Önce 'sync' komutuyla kirli tamponları diske yazar, ardından çekirdekte birikmiş "
+                    "PageCache, dentry ve inode önbelleklerini anında temizleyerek RAM'i ferahlatır."
+                ),
+                hw_impact=(
+                    f"Uzun süreli kullanımdan sonra {hw.ram_total_gb:.1f} GB RAM üzerinde parçalanmış (fragmented) önbellek "
+                    "bloklarını temizleyerek büyük uygulamalar için kesintisiz (contiguous) bellek alanı açar."
+                ),
+                risk_side_effect=(
+                    "Anlık (one-shot) bir işlemdir; veri kaybı yapmaz. Temizlikten hemen sonra ilk açılan "
+                    "uygulamalarda diskten yeniden okuma yapılacağı için 1-2 saniyelik ısınma süresi oluşabilir."
+                ),
+                check_fn=lambda: (
+                    bool(self.state.data.get("toggles", {}).get("mem_drop_caches", {}).get("enabled", False)),
+                    "Hazır (Tek Dokunuşla Tetiklenir)",
+                ),
+                toggle_fn=lambda _en: self.storage.trigger_drop_caches(),
+                is_one_shot=True,
+            ),
+            TuningOption(
+                option_id="mem_tmpfs_tmp",
+                category="BELLEK",
+                title="tmpfs /tmp RAM Diski (tmp.mount)",
+                target_summary="systemctl enable --now tmp.mount",
+                func_desc=(
+                    "Sistemin '/tmp' geçici dizinini fiziksel disk yerine doğrudan RAM üzerinde "
+                    "çalışan ultra hızlı 'tmpfs' dosya sistemine bağlar."
+                ),
+                hw_impact=(
+                    f"{hw.ram_total_gb:.1f} GB RAM kapasitesi ile derleyiciler, tarayıcı önbellekleri "
+                    "ve paket yöneticisinin geçici dosya G/Ç işlemlerini disk yerine RAM hızında "
+                    "gerçekleştirir; disk yazma yıpranmasını azaltır."
+                ),
+                risk_side_effect=(
+                    "/tmp altına yazılan dosyalar sistem kapatıldığında silinir (POSIX standardı). "
+                    f"/tmp içine {hw.ram_total_gb * 0.5:.1f} GB'tan (RAM'in %50'si) büyük tekil geçici dosya yazılmamalıdır."
+                ),
+                check_fn=lambda: (
+                    SystemdManager.get_unit_active_state(TMPFS_MOUNT_UNIT) == "active",
+                    f"{SystemdManager.get_unit_active_state(TMPFS_MOUNT_UNIT)} ({SystemdManager.get_unit_enabled_state(TMPFS_MOUNT_UNIT)})",
+                ),
+                toggle_fn=self.systemd.set_tmpfs_mount,
+            ),
+            # ---------------- DEPOLAMA (STORAGE) ----------------
+            TuningOption(
+                option_id="storage_fstab_noatime",
+                category="DEPOLAMA",
+                title="/etc/fstab 'noatime' Optimizasyonu",
+                target_summary="Kök (/) mount -> noatime",
+                func_desc=(
+                    "Dosyalar her okunduğunda dosya sisteminin 'son erişim zamanı' (access time) "
+                    "üstverisini diske yeniden yazmasını devre dışı bırakır."
+                ),
+                hw_impact=(
+                    "Disk üzerindeki gereksiz küçük meta-veri yazma işlemlerini %20-30 oranında azaltır. "
+                    f"{hw.cpu_model} işlemcinin G/Ç bekleme (iowait) süresini düşürür ve depolama ömrünü uzatır."
+                ),
+                risk_side_effect=(
+                    "Çok düşük risk (.bak yedeklidir). Yalnızca 'mutt' gibi antik yerel e-posta "
+                    "araçları dosya okuma saatine ihtiyaç duyar; modern masaüstünde hiçbir yan etkisi yoktur."
+                ),
+                check_fn=StorageAndKernelTuner.is_fstab_noatime_enabled,
+                toggle_fn=self.storage.set_fstab_noatime,
+            ),
+            TuningOption(
+                option_id="storage_ssd_scheduler",
+                category="DEPOLAMA",
+                title="SSD 'mq-deadline' I/O Scheduler Kuralı",
+                target_summary="rotational=0 -> mq-deadline (udev + sysfs)",
+                func_desc=(
+                    "/etc/udev/rules.d/60-ssd-scheduler.rules kuralı oluşturarak dönel olmayan "
+                    "(rotational=0) tüm SSD disklerde G/Ç zamanlayıcısını 'mq-deadline' olarak sabitler."
+                ),
+                hw_impact=(
+                    f"SSD disklerde ({', '.join(hw.ssd_devices) if hw.ssd_devices else 'rotational=0'}) "
+                    f"okuma/yazma kuyruğu açlığını (starvation) önler; {hw.cpu_model} arka planda "
+                    "disk yazarken masaüstü arayüzünün donmasını engeller."
+                ),
+                risk_side_effect=(
+                    "Tamamen güvenlidir. Yalnızca dönel olmayan (SSD) diskleri etkiler; mekanik HDD'lere dokunmaz."
+                ),
+                check_fn=self._check_ssd_scheduler,
+                toggle_fn=self.storage.set_ssd_scheduler,
+                supported=hw.has_ssd,
+                unsupported_reason="Sistemde dönel olmayan (rotational=0) SSD/NVMe disk tespit edilemedi.",
+            ),
+            TuningOption(
+                option_id="storage_fstrim",
+                category="DEPOLAMA",
+                title="Periyodik SSD TRIM (fstrim.timer)",
+                target_summary="systemctl enable --now fstrim.timer",
+                func_desc=(
+                    "Silinen dosya bloklarının SSD kontrolcüsüne haftalık olarak bildirilmesini "
+                    "sağlayan systemd 'fstrim.timer' birimini etkinleştirir."
+                ),
+                hw_impact=(
+                    "SSD'nin zamanla yazma hızının düşmesini (write amplification) engeller ve "
+                    "uzun vadeli SSD sağlığını korur."
+                ),
+                risk_side_effect="Hiçbir yan etkisi yoktur; tüm modern SSD üreticileri tarafından tavsiye edilir.",
+                check_fn=lambda: (
+                    SystemdManager.get_unit_enabled_state("fstrim.timer") in ("enabled", "enabled-runtime", "static"),
+                    f"fstrim.timer={SystemdManager.get_unit_enabled_state('fstrim.timer')}",
+                ),
+                toggle_fn=self.systemd.set_fstrim_timer,
+                supported=hw.has_ssd,
+                unsupported_reason="Sistemde SSD bulunmadığı için TRIM zamanlayıcısı gerekli değildir.",
+            ),
+            TuningOption(
+                option_id="storage_journald_limit",
+                category="DEPOLAMA",
+                title="Journald Log Sınırı (100M / 50M)",
+                target_summary="/etc/systemd/journald.conf.d/00-size-limit.conf",
+                func_desc=(
+                    "Systemd sistem günlüklerinin (journald) diskte en fazla 100 MB, RAM'de ise "
+                    "en fazla 50 MB yer kaplamasını sağlayan yapılandırmayı uygular ve mevcut logları budar."
+                ),
+                hw_impact=(
+                    "Disk üzerinde gigabaytlarca log birikmesini ve sistem açılışında journald tarama "
+                    "gecikmesini önler."
+                ),
+                risk_side_effect=(
+                    "Çok eski sistem günlükleri (100 MB öncesi) otomatik silinir; güncel hata ayıklama "
+                    "kayıtları korunur."
+                ),
+                check_fn=self._check_journald_limit,
+                toggle_fn=self.storage.set_journald_limit,
+            ),
+            # ---------------- İŞLEMCİ (CPU) ----------------
+            TuningOption(
+                option_id="cpu_governor_perf",
+                category="İŞLEMCİ",
+                title="CPU scaling_governor (performance)",
+                target_summary="scaling_governor = performance",
+                func_desc=(
+                    "İşlemci frekans ölçekleyicisini hem canlı sysfs üzerinden hem de açılışta "
+                    "çalışan systemd servisi ile 'performance' moduna sabitler."
+                ),
+                hw_impact=(
+                    f"{hw.cpu_model} ({hw.cpu_cores} Çekirdek) işlemcide "
+                    "frekans geçişlerinin yarattığı masaüstü mikrotakılmalarını "
+                    "tamamen ortadan kaldırır."
+                ),
+                risk_side_effect=(
+                    "Boşta güç tüketimini yaklaşık 1-2W artırabilir; masaüstü kullanımında "
+                    "maksimum akıcılık sağlar."
+                ),
+                check_fn=self._check_cpu_governor,
+                toggle_fn=lambda en: self.cpu.apply_governor() if en else self.cpu.rollback_governor(),
+                supported=hw.has_cpufreq,
+                unsupported_reason="Çekirdekte cpufreq scaling_governor arayüzü bulunamadı.",
+            ),
+            TuningOption(
+                option_id="cpu_sched_latency",
+                category="İŞLEMCİ",
+                title="Zamanlayıcı Gecikme Optimizasyonu (sched_latency / EEVDF)",
+                target_summary="base_slice_ns=2ms & sched_autogroup=1",
+                func_desc=(
+                    "Çekirdek görev zamanlayıcısının (CFS sched_latency_ns veya Linux 6.12 EEVDF "
+                    "base_slice_ns) zaman dilimini masaüstü etkileşimi için 2-4 ms seviyesine çeker "
+                    "ve oturum gruplamasını (autogroup) etkinleştirir."
+                ),
+                hw_impact=(
+                    f"{hw.cpu_cores} çekirdekli {hw.cpu_model} üzerinde arka planda yoğun bir işlem çalışırken bile "
+                    "pencere geçişlerinin ve ses/video akışının kesintisiz kalmasını sağlar."
+                ),
+                risk_side_effect=(
+                    "Çok uzun süreli toplu derleme (batch) işlerinde %1-2 bağlam değiştirme (context switch) "
+                    "yükü ekleyebilir; masaüstü tepkiselliğini belirgin biçimde artırır."
+                ),
+                check_fn=CpuGovernorManager.get_sched_latency_status,
+                toggle_fn=lambda en: self.cpu.set_sched_latency(en, self.sysctl),
+            ),
+            # ---------------- GRAFİK (GRAPHICS) ----------------
+            TuningOption(
+                option_id="gpu_i915_fbc",
+                category="GRAFİK",
+                title="Intel i915 Framebuffer Compression (enable_fbc=1)",
+                target_summary="/etc/modprobe.d/i915.conf -> enable_fbc=1",
+                func_desc=(
+                    "Intel i915 çekirdek grafik sürücüsünde Çerçeve Tamponu Sıkıştırmasını "
+                    "(Framebuffer Compression - FBC) etkinleştirir."
+                ),
+                hw_impact=(
+                    f"{hw.gpu_model} tümleşik grafik birimi sistemin {hw.ram_total_gb:.1f} GB RAM'ini paylaşır. "
+                    "FBC, ekran yenilemelerinde RAM veriyolu bant genişliği tüketimini düşürerek "
+                    f"{hw.cpu_model} işlemciye daha fazla bant genişliği bırakır."
+                ),
+                risk_side_effect=(
+                    "Çok nadir eski monitör/panel kombinasyonlarında titreme olursa bu anahtardan "
+                    "kapatılıp yeniden başlatılabilir."
+                ),
+                check_fn=self._check_i915_fbc,
+                toggle_fn=self.storage.set_i915_fbc,
+                supported=hw.has_intel_gpu,
+                unsupported_reason=f"Bu ayar yalnızca Intel (i915) GPU sürücüsünde desteklenir (Mevcut: {hw.gpu_driver}).",
+            ),
+            TuningOption(
+                option_id="gpu_gnome_animations",
+                category="GRAFİK",
+                title="GNOME Masaüstü Animasyonlarını Kapat (enable-animations=false)",
+                target_summary="org.gnome.desktop.interface enable-animations = false",
+                func_desc=(
+                    "GNOME Shell pencere açılış/kapanış, genel görünüm (Overview) ve çalışma alanı "
+                    "geçiş animasyonlarını devre dışı bırakır; ayrıca Tracker3 indeksleyicisini susturur."
+                ),
+                hw_impact=(
+                    f"{hw.cpu_model} ve {hw.gpu_model} üzerindeki masaüstü kompozitör yükünü büyük ölçüde "
+                    "azaltır; pencereler gecikmesiz ve anında açılır."
+                ),
+                risk_side_effect=(
+                    "Yalnızca görsel geçiş efektleri kapanır; tüm masaüstü işlevleri normal çalışmaya devam eder."
+                ),
+                check_fn=self._check_gnome_animations,
+                toggle_fn=self.gnome.set_animations_disabled,
+                supported=hw.has_gnome,
+                unsupported_reason=f"Aktif masaüstü ortamı GNOME değil (Tespit edilen: {hw.desktop_env}).",
+            ),
+            # ---------------- AĞ & PROTOKOL (NETWORK) ----------------
+            TuningOption(
+                option_id="net_tcp_bbr",
+                category="AĞ & PROTOKOL",
+                title="TCP BBR Tıkanıklık Kontrolü (Congestion Control)",
+                target_summary="default_qdisc=fq, tcp_congestion_control=bbr",
+                func_desc=(
+                    "Klasik CUBIC algoritması yerine Google tarafından geliştirilen bant genişliği ve "
+                    "RTT modellemeli 'BBR' (Bottleneck Bandwidth and Round-trip propagation time) "
+                    "algoritmasını ve 'fq' paket kuyruğunu etkinleştirir."
+                ),
+                hw_impact=(
+                    "Yerel ağda ve internet bağlantısında paket kaybı veya gecikme yaşandığında "
+                    "indirme hızını ve sayfa yükleme tepkiselliğini önemli ölçüde artırır."
+                ),
+                risk_side_effect="Linux 4.9+ çekirdeklerde yerleşik ve kararlıdır; hiçbir yan etkisi yoktur.",
+                check_fn=lambda: (
+                    SysctlTuner.get_current_value("net.ipv4.tcp_congestion_control") == "bbr",
+                    f"congestion={SysctlTuner.get_current_value('net.ipv4.tcp_congestion_control')}",
+                ),
+                toggle_fn=self._toggle_tcp_bbr,
+            ),
+            TuningOption(
+                option_id="net_tcp_fastopen",
+                category="AĞ & PROTOKOL",
+                title="TCP Fast Open (net.ipv4.tcp_fastopen=3)",
+                target_summary="net.ipv4.tcp_fastopen = 3 (İstemci + Sunucu)",
+                func_desc=(
+                    "Tekrarlanan TCP bağlantılarında 3 aşamalı el sıkışma (SYN) paketi sırasında "
+                    "veri gönderilmesine izin vererek bağlantı kurulum gecikmesini 1 RTT kısaltır."
+                ),
+                hw_impact=(
+                    "Web tarayıcısı, APT depo güncellemeleri ve SSH bağlantılarında ilk bayt "
+                    "alma süresini (TTFB) hızlandırır."
+                ),
+                risk_side_effect=(
+                    "Çok düşük risk. TFO desteklemeyen eski güvenlik duvarlarında çekirdek otomatik "
+                    "olarak standart TCP el sıkışmasına geri döner."
+                ),
+                check_fn=lambda: (
+                    SysctlTuner.get_current_value("net.ipv4.tcp_fastopen") == "3",
+                    f"tcp_fastopen={SysctlTuner.get_current_value('net.ipv4.tcp_fastopen')}",
+                ),
+                toggle_fn=lambda en: self._toggle_sysctl("net_tcp_fastopen", "net.ipv4.tcp_fastopen", "3", "1", en),
+            ),
+            # ---------------- SERVİSLER (TEKİL AÇ/KAPA) ----------------
+            self._build_service_option(
+                option_id="srv_plymouth_wait",
+                title="plymouth-quit-wait.service (Maskele)",
+                units=["plymouth-quit-wait.service"],
+                func_desc="Açılış animasyonunun (Plymouth) kapanmasını bekleyen systemd kilidini maskeler.",
+                hw_impact="Sistemde giriş ekranının 3-8 saniye daha erken gelmesini sağlar.",
+                risk_side_effect="Hiçbir riski yoktur; yalnızca açılış logosu geçiş süresini kaldırır.",
+            ),
+            self._build_service_option(
+                option_id="srv_nm_wait_online",
+                title="NetworkManager-wait-online (Maskele)",
+                units=["NetworkManager-wait-online.service", "systemd-networkd-wait-online.service"],
+                func_desc="Açılışta ağ bağlantısı kurulana kadar hedef birimlerin bekletilmesini engeller.",
+                hw_impact="Kablo takılı olmadığında veya Wi-Fi geç bağlandığında yaşanan 30-90 sn açılış takılmasını önler.",
+                risk_side_effect="Açılışta NFS/SMB ağ diski bağlamıyorsanız tamamen güvenlidir.",
+            ),
+            self._build_service_option(
+                option_id="srv_modemmanager",
+                title="ModemManager.service (Maskele)",
+                units=["ModemManager.service"],
+                func_desc="3G/4G/LTE mobil genişbant modem yönetim ve seri port tarama servisini maskeler.",
+                hw_impact="Arka planda bellek tüketimini azaltır ve USB seri cihazların (3D yazıcı/Arduino) meşgul edilmesini önler.",
+                risk_side_effect="Bilgisayarda SIM kartlı 3G/4G USB modem kullanmıyorsanız hiçbir yan etkisi yoktur.",
+            ),
+            self._build_service_option(
+                option_id="srv_bluetooth",
+                title="bluetooth.service (Maskele)",
+                units=["bluetooth.service"],
+                func_desc="BlueZ Bluetooth yığınını ve arka plan servisini maskeler.",
+                hw_impact="Bluetooth kullanılmayan masaüstünde RAM ve kesme yükünü azaltır.",
+                risk_side_effect="Bluetooth kulaklık, fare veya dosya aktarımı kullanıyorsanız bu ayarı KAPALI ([ ]) bırakın.",
+            ),
+            self._build_service_option(
+                option_id="srv_avahi",
+                title="avahi-daemon.service & socket (Maskele)",
+                units=["avahi-daemon.service", "avahi-daemon.socket"],
+                func_desc="Yerel ağda sıfır yapılandırmalı mDNS/DNS-SD (.local) yayın ve keşif servisini maskeler.",
+                hw_impact="Ağ trafiği kesmelerini ve arka plan süreç sayısını azaltır.",
+                risk_side_effect="Ağ üzerinden otomatik Bonjour/mDNS yazıcı keşfi kullanıyorsanız [ ] konumunda bırakın.",
+            ),
+            self._build_service_option(
+                option_id="srv_cups",
+                title="cups.service (Yazıcı Servisi Maskele)",
+                units=["cups.service", "cups.socket", "cups.path"],
+                func_desc="CUPS (Common UNIX Printing System) yazdırma sunucusunu ve soketlerini maskeler.",
+                hw_impact="Yazıcı bağlı olmayan bilgisayarlarda RAM ve açılış süresinden tasarruf sağlar.",
+                risk_side_effect="Fiziksel veya ağ yazıcısından çıktı alıyorsanız bu ayarı [ ] konumunda bırakın.",
+            ),
+            self._build_service_option(
+                option_id="srv_packagekit",
+                title="packagekit.service (Arka Plan Mağaza Servisi Maskele)",
+                units=["packagekit.service"],
+                func_desc="Yazılım mağazasının arka planda otomatik depo indirme servisini maskeler.",
+                hw_impact=(
+                    f"{hw.cpu_model} işlemcinin ve {hw.ram_total_gb:.1f} GB RAM'in arka planda habersiz PackageKit "
+                    "taramalarıyla kilitlenmesini ve APT kilidi (dpkg lock) çakışmalarını önler."
+                ),
+                risk_side_effect=(
+                    "Terminal üzerinden 'apt' kullanımı etkilenmez. Grafiksel Yazılım mağazası "
+                    "kullanılacaksa bu anahtar tekrar geri açılabilir."
+                ),
+            ),
+            self._build_service_option(
+                option_id="srv_apt_daily",
+                title="apt-daily.timer & upgrade (Otomatik Güncelleme Maskele)",
+                units=["apt-daily.timer", "apt-daily-upgrade.timer", "apt-daily.service", "apt-daily-upgrade.service"],
+                func_desc="Sistem açılışında ve gün içinde otomatik çalışan katılımsız APT güncelleme zamanlayıcılarını maskeler.",
+                hw_impact=(
+                    f"Bilgisayar ilk açıldığında {hw.cpu_model} işlemcinin %100 yüklenerek diskte "
+                    "dakikalarca paket listesi sıkıştırması yapmasını engeller."
+                ),
+                risk_side_effect="Güvenlik güncellemelerini zaman zaman 'sudo apt update && sudo apt upgrade' ile manuel yapmanız önerilir.",
+            ),
+        ]
+        return opts
+
+    def _toggle_sysctl(self, opt_id: str, key: str, target_val: str, default_val: str, enable: bool) -> None:
+        self.sysctl.set_param(key, target_val, enable=enable, fallback_default=default_val)
+        self.state.set_toggle_state(opt_id, enable)
+
+    def _toggle_tcp_bbr(self, enable: bool) -> None:
+        if enable:
+            if check_command_exists("modprobe"):
+                run_cmd(["modprobe", "tcp_bbr"])
+            self.state.backup_and_write_file(MODULES_BBR_PATH, "tcp_bbr\n", mode=0o644)
+            self.sysctl.set_param("net.core.default_qdisc", "fq", enable=True, fallback_default="pfifo_fast")
+            self.sysctl.set_param("net.ipv4.tcp_congestion_control", "bbr", enable=True, fallback_default="cubic")
+            self.state.set_toggle_state("net_tcp_bbr", True)
+        else:
+            self.state.restore_file(MODULES_BBR_PATH)
+            self.sysctl.set_param("net.ipv4.tcp_congestion_control", "cubic", enable=False, fallback_default="cubic")
+            self.sysctl.set_param("net.core.default_qdisc", "pfifo_fast", enable=False, fallback_default="pfifo_fast")
+            self.state.set_toggle_state("net_tcp_bbr", False)
+
+    def _check_ssd_scheduler(self) -> Tuple[bool, str]:
+        scheds = StorageAndKernelTuner.get_non_rotational_schedulers()
+        udev_ok = UDEV_SSD_RULES_PATH.exists()
+        if not scheds:
+            return udev_ok, "SSD Yok"
+        s_txt = ",".join(f"{k}:{v}" for k, v in scheds.items())
+        all_mq = udev_ok and all(v == TARGET_SSD_SCHEDULER for v in scheds.values())
+        return all_mq, f"{s_txt} ({'udev:ok' if udev_ok else 'udev:yok'})"
+
+    def _check_journald_limit(self) -> Tuple[bool, str]:
+        if JOURNALD_LIMIT_CONF_PATH.exists():
+            try:
+                txt = JOURNALD_LIMIT_CONF_PATH.read_text(encoding="utf-8")
+                if "100M" in txt and "50M" in txt:
+                    return True, "100M / 50M (Aktif)"
+            except Exception:
+                pass
+        return False, "Varsayılan (Sınırsız)"
+
+    def _check_cpu_governor(self) -> Tuple[bool, str]:
+        govs = CpuGovernorManager.get_current_governors()
+        if govs:
+            uniq = ",".join(sorted(set(govs)))
+            is_perf = all(g == TARGET_CPU_GOVERNOR for g in govs)
+            return is_perf, f"{uniq} ({'Servis Aktif' if CPU_GOV_SERVICE_PATH.exists() else 'Canlı'})"
+        srv_ok = CPU_GOV_SERVICE_PATH.exists()
+        return srv_ok, "Servis Hazır" if srv_ok else "Varsayılan"
+
+    def _check_i915_fbc(self) -> Tuple[bool, str]:
+        if MODPROBE_I915_PATH.exists():
+            try:
+                if "enable_fbc=1" in MODPROBE_I915_PATH.read_text(encoding="utf-8"):
+                    return True, "enable_fbc=1 (Aktif)"
+            except Exception:
+                pass
+        return False, "Varsayılan (Kapalı)"
+
+    def _check_gnome_animations(self) -> Tuple[bool, str]:
+        val = self.gnome.get_gsettings_value("org.gnome.desktop.interface", "enable-animations")
+        return val == "false", f"enable-animations={val}"
+
+    def _build_service_option(
+        self,
+        option_id: str,
+        title: str,
+        units: List[str],
+        func_desc: str,
+        hw_impact: str,
+        risk_side_effect: str,
+    ) -> TuningOption:
+        primary = units[0]
+
+        def _chk() -> Tuple[bool, str]:
+            st = SystemdManager.get_unit_enabled_state(primary)
+            act = SystemdManager.get_unit_active_state(primary)
+            return st == "masked", f"{st} ({act})"
+
+        def _tgl(enable: bool) -> None:
+            if enable:
+                self.systemd.mask_units(units, toggle_id=option_id)
+            else:
+                self.systemd.unmask_and_restore_units(units, toggle_id=option_id)
+
+        return TuningOption(
+            option_id=option_id,
+            category="SERVİSLER (TEKİL AÇ/KAPA)",
+            title=title,
+            target_summary=f"systemctl mask {' '.join(units)}",
+            func_desc=func_desc,
+            hw_impact=hw_impact,
+            risk_side_effect=risk_side_effect,
+            check_fn=_chk,
+            toggle_fn=_tgl,
+        )
+
+
+# ==============================================================================
+# MODÜL 9: DOĞRULAMA (SELF-TEST) VERİ TOPLAYICI VE TABLO RAPORLAYICI
+# ==============================================================================
+
+class SelfTester:
+    """
+    Sistemdeki tüm granüler optimizasyon bileşenlerini canlı olarak denetler;
+    hem TUI renkli tablo hem de CLI ASCII rapor üretir.
+    """
+
+    def __init__(self, user_info: Optional[pwd.struct_passwd]) -> None:
+        self.user_info = user_info
+        self.state = StateManager()
+        self.registry = GranularTuningRegistry(self.state, user_info)
+
+    def collect_rows(self, rollback_mode: bool = False) -> Tuple[List[Tuple[str, str, str, str]], bool]:
+        rows: List[Tuple[str, str, str, str]] = []
+        all_passed = True
+
+        for opt in self.registry.build_options():
+            if opt.is_one_shot:
+                continue
+            if not opt.supported:
+                rows.append((f"{opt.category}: {opt.title}", "Donanım Filtresi", opt.unsupported_reason[:28], "[DESTEKLENMİYOR]"))
+                continue
+            is_enabled, live_str = opt.check_fn()
+            if rollback_mode:
+                expected = "Varsayılan (Kapalı)"
+                passed = not is_enabled
+            else:
+                expected = opt.target_summary[:26]
+                passed = is_enabled
+            status = "[BAŞARILI]" if passed else "[BAŞARISIZ]"
+            if not passed:
+                all_passed = False
+            rows.append((f"{opt.category}: {opt.title}", expected, live_str, status))
+
+        removed_pkgs = self.state.data.get("removed_packages", [])
+        removed_count = len(removed_pkgs) if isinstance(removed_pkgs, list) else 0
+        if rollback_mode:
+            debloat_expected = "0 (Geri Yüklendi)"
+            debloat_passed = removed_count == 0
+            debloat_status = "[BAŞARILI]" if debloat_passed else "[BAŞARISIZ]"
+            if not debloat_passed:
+                all_passed = False
+        else:
+            debloat_expected = "Kayıtlı Liste"
+            debloat_status = "[BİLGİ]"
+        rows.append(("DEBLOAT: removed_packages", debloat_expected, f"{removed_count} paket", debloat_status))
+
+        return rows, all_passed
+
+    def run_checks(self, rollback_mode: bool = False) -> bool:
+        rows, all_passed = self.collect_rows(rollback_mode=rollback_mode)
+        self._print_ascii_table(rows)
+        return all_passed
+
+    @staticmethod
+    def _print_ascii_table(rows: List[Tuple[str, str, str, str]]) -> None:
+        headers = ("BİLEŞEN / PARAMETRE", "BEKLENEN DEĞER", "MEVCUT DEĞER", "DURUM")
+        col_widths = [len(h) for h in headers]
+
+        for row in rows:
+            for idx, cell in enumerate(row):
+                if len(cell) > col_widths[idx]:
+                    col_widths[idx] = len(cell)
+
+        sep = "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
+        header_line = "|" + "|".join(f" {headers[i]:<{col_widths[i]}} " for i in range(len(headers))) + "|"
+
+        print("\n" + sep)
+        print(header_line)
+        print(sep)
+        for row in rows:
+            line = "|" + "|".join(f" {row[i]:<{col_widths[i]}} " for i in range(len(row))) + "|"
+            print(line)
+        print(sep + "\n")
+
+
+# ==============================================================================
+# MODÜL 10: BÖLÜNMÜŞ EKRANLI (SPLIT-VIEW CURSES TUI) GELİŞMİŞ AYAR İSTASYONU
+# ==============================================================================
+
+SYSTEM_SYMLINK_PATH: Path = Path("/usr/local/bin/pardus-kokpit")
+
+
+def install_system_symlink() -> Tuple[bool, str]:
+    """
+    Programın '/usr/local/bin/pardus-kokpit' konumundan her yerden doğrudan
+    çağrılabilmesi için çalışma izni (chmod +x) ve sembolik bağ kurulumunu yapar.
+    """
+    script_path = Path(__file__).resolve()
+    try:
+        if is_root():
+            current_mode = script_path.stat().st_mode
+            script_path.chmod(current_mode | 0o755)
+            SYSTEM_SYMLINK_PATH.parent.mkdir(parents=True, exist_ok=True)
+            if SYSTEM_SYMLINK_PATH.exists() or SYSTEM_SYMLINK_PATH.is_symlink():
+                try:
+                    if SYSTEM_SYMLINK_PATH.resolve() == script_path:
+                        return True, f"Aktif ({SYSTEM_SYMLINK_PATH} -> {script_path})"
+                except Exception:
+                    pass
+                SYSTEM_SYMLINK_PATH.unlink()
+            SYSTEM_SYMLINK_PATH.symlink_to(script_path)
+            log_info(f"Sistem kısayolu oluşturuldu: {SYSTEM_SYMLINK_PATH} -> {script_path}")
+            return True, f"Kuruldu ({SYSTEM_SYMLINK_PATH} -> {script_path})"
+        else:
+            if SYSTEM_SYMLINK_PATH.is_symlink() and SYSTEM_SYMLINK_PATH.resolve() == script_path:
+                return True, f"Aktif ({SYSTEM_SYMLINK_PATH})"
+            return False, "Root (sudo) yetkisiyle çalıştırıldığında otomatik kurulur"
+    except Exception as exc:
+        return False, f"Kısayol hatası: {exc}"
+
+
+class OptimizerSplitViewStation:
+    """
+    Pardus Kokpit — Kurumsal ve Siber-HUD (Tokyo Night / Cyber-HUD) Görsel Motoru:
+      - İsimlendirme & Amblem : "Pardus Kokpit" resmi adı, Unicode yarım bloklarla (▄ █ ▀ ▌ ▐)
+                                çizilmiş köşeli siber Anadolu Parsı amblemi ve kavisli kutular (╭ ╮ ╯ ╰).
+      - Fütüristik Palet      :
+          * COLOR_CYAN    : Ana çerçeveler (╭ ─ ╮ │ ╰ ─ ╯) ve siber Anadolu Parsı amblemi
+          * COLOR_GREEN   : Aktif telemetri ve [■] işaretli anahtarlar
+          * COLOR_MAGENTA : Kategori ayraçları ve sekme başlıkları
+          * COLOR_YELLOW  : Donanım teknik analiz başlıkları
+          * Gösterge Barı : Yüzdelik durumlar için '▰▰▰▰▱▱▱▱' Unicode barları
+      - Sekmeli Navigasyon    :
+          [F1] KOKPİT │ [F2] GÜÇ & OC │ [F3] DİSK & RAM │ [F4] SERVİSLER │ [F5] DEBLOAT │ [F6] GERİ AL
+          Tab / Shift-Tab, Sol/Sağ Ok (←/→), 1-6 ve F1-F6 tuşları.
+      - Sistem Kısayolu       : /usr/local/bin/pardus-kokpit sembolik bağ kurulumu.
+    """
+
+    APP_TITLE: str = "Pardus Kokpit"
+
+    PARS_ASCII_LOGO: Tuple[str, str, str] = (
+        "▛▀▄  ▄▀▜",
+        "▌█▀██▀█▐",
+        "▘▀████▀▝",
+    )
+
+    TABS: Tuple[str, ...] = (
+        "[F1] KOKPİT",
+        "[F2] GÜÇ & OC",
+        "[F3] DİSK & RAM",
+        "[F4] SERVİSLER",
+        "[F5] DEBLOAT",
+        "[F6] GERİ AL",
+    )
+
+    MENU_ITEMS: Tuple[str, ...] = (
+        "[1] Tüm Sistem Optimizasyonlarını Uygula",
+        "[2] Paket Temizleme ve Debloat Sihirbazı",
+        "[3] Canlı Sistem Doğrulama Tablosu (Self-Test)",
+        "[4] Granüler Ayar Anahtarları (Split-View)",
+        "[5] Fabrika Ayarlarına Geri Dön (Rollback)",
+        "[6] Donanım Güç & Overclock Modülü",
+    )
+
+    def __init__(self, user_info: Optional[pwd.struct_passwd]) -> None:
+        self.user_info = user_info
+        self.state = StateManager()
+        self.hw_profile: HardwareProfile = UniversalHardwareDetector.detect()
+        self.registry = GranularTuningRegistry(self.state, user_info)
+        self.options: List[TuningOption] = self.registry.build_options()
+        self.status_Cache: Dict[str, Tuple[bool, str]] = {}
+        self.welcome_shown: bool = False
+        self.active_tab: int = 0
+        self.tab_cursors: Dict[int, int] = {i: 0 for i in range(len(self.TABS))}
+        self.tab_scrolls: Dict[int, int] = {i: 0 for i in range(len(self.TABS))}
+        self.symlink_ok, self.symlink_status = install_system_symlink()
+        self.last_status_msg: str = (
+            "Pardus Kokpit Hazır — Sekmeler: [Tab/←/→/F1-F6] │ Anahtar: [Space/Enter]"
+        )
+
+        self.color_border = curses.A_NORMAL
+        self.color_header = curses.A_BOLD
+        self.color_ok = curses.A_BOLD
+        self.color_inactive = curses.A_NORMAL
+        self.color_warn = curses.A_BOLD
+        self.color_err = curses.A_BOLD
+        self.color_status = curses.A_REVERSE | curses.A_BOLD
+        self.color_category = curses.A_BOLD
+        self.color_desc_header = curses.A_BOLD
+        self.color_desc_body = curses.A_NORMAL
+        self.color_tab_active = curses.A_REVERSE | curses.A_BOLD
+        self.color_tab_inactive = curses.A_BOLD
+
+    @staticmethod
+    def _make_cyber_bar(percent: float, width: int = 8) -> str:
+        """Yüzdelik durumlar için '▰▰▰▰▱▱▱▱' Unicode siber gösterge barı üretir."""
+        clamped = max(0.0, min(100.0, percent))
+        filled = int(round((clamped / 100.0) * width))
+        filled = max(0, min(width, filled))
+        return ("▰" * filled) + ("▱" * (width - filled))
+
+    @staticmethod
+    def _get_ram_usage_percent() -> float:
+        """Canlı RAM kullanım yüzdesini hesaplar."""
+        try:
+            mem_total = 0
+            mem_avail = 0
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        mem_total = int(line.split()[1])
+                    elif line.startswith("MemAvailable:"):
+                        mem_avail = int(line.split()[1])
+            if mem_total > 0:
+                return ((mem_total - mem_avail) / mem_total) * 100.0
+        except Exception:
+            pass
+        return 0.0
+
+    def refresh_statuses(self) -> None:
+        """Tüm granüler ayarların canlı sistem durumlarını günceller."""
+        self.state._load()
+        for opt in self.options:
+            try:
+                self.status_Cache[opt.option_id] = opt.check_fn()
+            except Exception as exc:
+                self.status_Cache[opt.option_id] = (False, f"Hata: {exc}")
+
+    @staticmethod
+    def _safe_addstr(win: Any, y: int, x: int, text: str, attr: int = 0) -> None:
+        try:
+            max_y, max_x = win.getmaxyx()
+            if y < 0 or y >= max_y or x < 0 or x >= max_x:
+                return
+            avail = max_x - x - 1
+            if avail <= 0:
+                return
+            win.addstr(y, x, text[:avail], attr)
+        except curses.error:
+            pass
+
+    def _init_colors(self) -> None:
+        """
+        Pardus Kokpit — Fütüristik Renk Paleti (Tokyo Night / Cyber-HUD):
+          - COLOR_CYAN    : Ana çerçeveler (╭ ─ ╮ │ ╰ ─ ╯) ve siber Anadolu Parsı amblemi
+          - COLOR_GREEN   : Aktif telemetri ve [■] işaretli anahtarlar
+          - COLOR_MAGENTA : Kategori ayraçları ve sekme başlıkları
+          - COLOR_YELLOW  : Donanım teknik analiz başlıkları
+          - Alt Çubuk     : COLOR_BLUE / COLOR_WHITE (A_REVERSE)
+        """
+        try:
+            if curses.has_colors():
+                curses.start_color()
+                curses.use_default_colors()
+                curses.init_pair(1, curses.COLOR_CYAN, -1)
+                curses.init_pair(2, curses.COLOR_GREEN, -1)
+                curses.init_pair(3, curses.COLOR_BLUE, curses.COLOR_WHITE)
+                curses.init_pair(4, curses.COLOR_YELLOW, -1)
+                curses.init_pair(5, curses.COLOR_RED, -1)
+                curses.init_pair(10, curses.COLOR_YELLOW, -1)
+                curses.init_pair(11, curses.COLOR_GREEN, -1)
+                curses.init_pair(12, curses.COLOR_WHITE, -1)
+                curses.init_pair(6, curses.COLOR_MAGENTA, -1)
+                curses.init_pair(7, curses.COLOR_WHITE, -1)
+
+                self.color_border = curses.color_pair(1)
+                self.color_header = curses.color_pair(1) | curses.A_BOLD
+                self.color_ok = curses.color_pair(2) | curses.A_BOLD
+                self.color_inactive = curses.color_pair(7) | curses.A_NORMAL
+                self.color_status = curses.color_pair(3) | curses.A_REVERSE | curses.A_BOLD
+                self.color_warn = curses.color_pair(4) | curses.A_BOLD
+                self.color_err = curses.color_pair(5) | curses.A_BOLD
+                self.color_category = curses.color_pair(6) | curses.A_BOLD
+                self.color_desc_header = curses.color_pair(4) | curses.A_BOLD
+                self.color_desc_body = curses.color_pair(7) | curses.A_NORMAL
+                self.color_tab_active = curses.color_pair(6) | curses.A_REVERSE | curses.A_BOLD
+                self.color_tab_inactive = curses.color_pair(6) | curses.A_BOLD
+        except curses.error:
+            pass
+
+    def _draw_tab_bar(self, stdscr: Any, y: int) -> None:
+        """
+        Yatay Sekmeli Navigasyon (Tabbed HUD) çubuğunu çizer:
+        [F1] KOKPİT │ [F2] GÜÇ & OC │ [F3] DİSK & RAM │ [F4] SERVİSLER │ [F5] DEBLOAT │ [F6] GERİ AL
+        COLOR_MAGENTA sekme başlıkları; aktif sekme A_REVERSE, inaktifler A_BOLD.
+        """
+        _, max_x = stdscr.getmaxyx()
+        self._safe_addstr(stdscr, y, 0, "│", self.color_border)
+        self._safe_addstr(stdscr, y, max_x - 2, "│", self.color_border)
+
+        cur_x = 2
+        for idx, tab_label in enumerate(self.TABS):
+            if idx > 0:
+                sep = " │ "
+                if cur_x + len(sep) < max_x - 2:
+                    self._safe_addstr(stdscr, y, cur_x, sep, self.color_border)
+                cur_x += len(sep)
+
+            badge = f" {tab_label} "
+            attr = self.color_tab_active if idx == self.active_tab else self.color_tab_inactive
+            if cur_x < max_x - 2:
+                self._safe_addstr(stdscr, y, cur_x, badge, attr)
+            cur_x += len(badge)
+
+    def _draw_top_telemetry_header(
+        self,
+        stdscr: Any,
+        subtitle: str,
+        split_col: Optional[int] = None,
+        show_tabs: bool = True,
+    ) -> int:
+        """Pardus Kokpit fütüristik telemetri başlığını çizer. Menülerde Alternatif 2 Pars Logosunu kullanır."""
+        max_y, max_x = stdscr.getmaxyx()
+        inner_w = max(0, max_x - 3)
+        mid_border = "├" + "─" * inner_w + "┤"
+        if split_col is not None and 1 < split_col < max_x - 2:
+            left_seg = split_col - 1
+            right_seg = max(0, inner_w - left_seg - 1)
+            bottom_border = "├" + ("─" * left_seg) + "┬" + ("─" * right_seg) + "┤"
+        else:
+            bottom_border = "├" + "─" * inner_w + "┤"
+
+        cpu_gov = HardwareTelemetry.get_cpu_governor_summary()
+        gpu_freq = HardwareTelemetry.get_gpu_freq_summary()
+        ram_pct = self._get_ram_usage_percent()
+        ram_bar = self._make_cyber_bar(ram_pct, width=8)
+        ssd_sched = HardwareTelemetry.get_ssd_scheduler_summary()
+        priv_str = "ROOT (Aktif)" if is_root() else "SALT-OKUNUR (sudo)"
+
+        cache_dict = getattr(self, "status_Cache", getattr(self, "status_cache", {}))
+        supported_total = max(1, sum(1 for opt in self.options if opt.supported))
+        active_count = sum(
+            1 for opt in self.options if opt.supported and cache_dict.get(opt.option_id, (False, ""))[0]
+        )
+        opt_pct = (active_count / supported_total) * 100.0
+        opt_bar = self._make_cyber_bar(opt_pct, width=8)
+
+        # ----------------------------------------------------------------------
+        # A) MENÜLER İÇİN ALTERNATİF 2 ORİJİNAL RENKLİ PARS LOGOLU SİBER BAŞLIK
+        # ----------------------------------------------------------------------
+        if show_tabs and max_x >= 105 and max_y >= 28:
+            top_border = "╭" + ("─" * 47) + "┬" + ("─" * max(0, inner_w - 48)) + "╮"
+            mid_header = "├" + ("─" * 47) + "┴" + ("─" * max(0, inner_w - 48)) + "┤"
+            self._safe_addstr(stdscr, 0, 0, top_border, self.color_border)
+
+            # Sol Bölme: 13 Satırlık Orijinal Kurumsal Pars Başı (Altın Sarısı & Zümrüt Yeşili)
+            self._draw_pardus_logo(stdscr, 1, 2)
+
+            # Dikey Ayırıcı Çerçeveler: Sol (0), Orta Hat (48) ve Sağ (max_x - 2)
+            for y_pos in range(1, 14):
+                self._safe_addstr(stdscr, y_pos, 0, "│", self.color_border)
+                self._safe_addstr(stdscr, y_pos, 48, "│", self.color_border)
+                self._safe_addstr(stdscr, y_pos, max_x - 2, "│", self.color_border)
+
+            # Sağ Bölme: Canlı Donanım Telemetrisi ve Komuta Paneli
+            rx = 50
+            rw = max(10, max_x - rx - 3)
+            hw = self.hw_profile
+
+            epb_text = "0 (Performance)" if hw.has_intel_epb else "Desteklenmiyor"
+            rapl_text = "35W Tavan" if hw.has_intel_rapl else "Desteklenmiyor"
+
+            title_text = "❖ PARDUS KOKPİT — SİBER-HUD DONANIM VE PERFORMANS MERKEZİ"
+            sys_info = f"[Yetki: {priv_str}] │ [Sistem: {hw.cpu_vendor} / {hw.desktop_env}] │ [Çekirdek: Linux]"
+            cpu_detail = f"• İşlemci (CPU)   : {cpu_gov} [{hw.cpu_model[:32]}]"
+            power_detail = f"• Güç & Hız       : EPB={epb_text} │ RAPL={rapl_text} │ C-State: Düşük Gecikme"
+            gpu_detail = f"• Grafik (GPU)    : {hw.gpu_model[:26]} │ Boost: {gpu_freq}"
+            ram_detail = f"• Bellek (RAM)    : {ram_bar} %{ram_pct:.0f} [{hw.ram_total_gb:.1f} GB RAM] │ /tmp: tmpfs"
+            disk_detail = f"• Depolama (SSD)  : SSD:{ssd_sched} │ noatime: Aktif │ fstrim.timer: Aktif"
+            opt_detail = f"• Optimizasyon    : {opt_bar} {active_count}/{supported_total} Aktif Bileşen Doğrulandı"
+            sub_detail = f"• Aktif Mod       : {subtitle}"
+            nav_detail = "• Gezinme Kılavuzu: [Tab / F1-F6] Sekmeler │ [↑/↓] Gezin │ [Space] Değiştir │ [Enter] Uygula"
+            status_detail = f"• Sistem Durumu   : {self.last_status_msg[:max(10, rw - 20)]}"
+
+            self._safe_addstr(stdscr, 1, rx, title_text[:rw], self.color_header)
+            self._safe_addstr(stdscr, 2, rx, sys_info[:rw], self.color_desc_header)
+            self._safe_addstr(stdscr, 3, rx, ("─" * rw)[:rw], self.color_border)
+            self._safe_addstr(stdscr, 4, rx, cpu_detail[:rw], self.color_desc_body | curses.A_BOLD)
+            self._safe_addstr(stdscr, 5, rx, power_detail[:rw], self.color_desc_body)
+            self._safe_addstr(stdscr, 6, rx, gpu_detail[:rw], self.color_desc_body | curses.A_BOLD)
+            self._safe_addstr(stdscr, 7, rx, ram_detail[:rw], self.color_ok)
+            self._safe_addstr(stdscr, 8, rx, disk_detail[:rw], self.color_desc_body)
+            self._safe_addstr(stdscr, 9, rx, opt_detail[:rw], self.color_ok)
+            self._safe_addstr(stdscr, 10, rx, ("─" * rw)[:rw], self.color_border)
+            self._safe_addstr(stdscr, 11, rx, sub_detail[:rw], self.color_desc_header)
+            self._safe_addstr(stdscr, 12, rx, nav_detail[:rw], self.color_desc_body)
+            self._safe_addstr(stdscr, 13, rx, status_detail[:rw], self.color_ok)
+
+            # Sekme Çubuğu ve Alt Çerçeve
+            self._safe_addstr(stdscr, 14, 0, mid_header, self.color_border)
+            self._draw_tab_bar(stdscr, 15)
+            self._safe_addstr(stdscr, 16, 0, bottom_border, self.color_border)
+            return 17
+
+        # ----------------------------------------------------------------------
+        # B) KOMPAKT MOD (Küçük Pencereler veya Karşılama Ekranı)
+        # ----------------------------------------------------------------------
+        top_border = "╭" + "─" * inner_w + "╮"
+        self._safe_addstr(stdscr, 0, 0, top_border, self.color_border)
+
+        title_line = (
+            f"❖ {self.APP_TITLE.upper()} ({self.APP_TITLE}) — SİBER-HUD DONANIM & OPTİMİZASYON ÜSSÜ "
+            f"[{self.hw_profile.cpu_vendor} / {self.hw_profile.desktop_env}]"
+        )
+        telemetry_line = (
+            f"CPU:{cpu_gov} │ GPU:{gpu_freq} │ RAM:{ram_bar} %{ram_pct:.0f} │ "
+            f"SSD:{ssd_sched} │ HUD:{opt_bar} {active_count}/{supported_total}"
+        )
+        sub_line = f"{subtitle}  [Yetki: {priv_str}]"
+
+        logo_w = len(self.PARS_ASCII_LOGO[0]) if hasattr(self, "PARS_ASCII_LOGO") else 8
+        text_area_x = 2 + logo_w + 2
+        text_area_w = max(1, max_x - text_area_x - 3)
+
+        for row_idx in range(3):
+            y_pos = 1 + row_idx
+            self._safe_addstr(stdscr, y_pos, 0, "│", self.color_border)
+            if hasattr(self, "PARS_ASCII_LOGO") and row_idx < len(self.PARS_ASCII_LOGO):
+                self._safe_addstr(stdscr, y_pos, 2, self.PARS_ASCII_LOGO[row_idx], self.color_header)
+                self._safe_addstr(stdscr, y_pos, 2 + logo_w, "│", self.color_border)
+            self._safe_addstr(stdscr, y_pos, max_x - 2, "│", self.color_border)
+
+        self._safe_addstr(stdscr, 1, text_area_x, title_line[:text_area_w].center(text_area_w), self.color_header)
+        self._safe_addstr(stdscr, 2, text_area_x, telemetry_line[:text_area_w].center(text_area_w), self.color_ok)
+        self._safe_addstr(stdscr, 3, text_area_x, sub_line[:text_area_w].center(text_area_w), self.color_desc_header)
+
+        if show_tabs:
+            self._safe_addstr(stdscr, 4, 0, mid_border, self.color_border)
+            self._draw_tab_bar(stdscr, 5)
+            self._safe_addstr(stdscr, 6, 0, bottom_border, self.color_border)
+            return 7
+        else:
+            self._safe_addstr(stdscr, 4, 0, bottom_border, self.color_border)
+            return 5
+
+    def _draw_status_bar(self, stdscr: Any, guide_text: str) -> None:
+        max_y, max_x = stdscr.getmaxyx()
+        msg_line = f" Durum: {self.last_status_msg}".ljust(max(0, max_x - 1))
+        bar_line = f" {guide_text} ".ljust(max(0, max_x - 1))
+        self._safe_addstr(stdscr, max_y - 2, 0, msg_line, self.color_desc_header)
+        self._safe_addstr(stdscr, max_y - 1, 0, bar_line, self.color_status)
+
+    def _show_modal_message(self, stdscr: Any, title: str, lines: List[str], is_error: bool = False) -> None:
+        while True:
+            stdscr.erase()
+            start_y = self._draw_top_telemetry_header(stdscr, title, show_tabs=False)
+            max_y, _ = stdscr.getmaxyx()
+            attr = self.color_err if is_error else self.color_ok
+
+            for idx, line in enumerate(lines):
+                if start_y + 1 + idx >= max_y - 3:
+                    break
+                self._safe_addstr(stdscr, start_y + 1 + idx, 2, line, attr if idx == 0 else curses.A_NORMAL)
+
+            self._draw_status_bar(stdscr, "[Enter / Space / Q] Pardus Kokpit'e Dön")
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch == curses.KEY_RESIZE:
+                try:
+                    curses.update_lines_cols()
+                except Exception:
+                    pass
+                continue
+            if ch in (10, 13, curses.KEY_ENTER, ord(" "), ord("q"), ord("Q"), 27):
+                break
+
+    def _ask_confirmation(self, stdscr: Any, title: str, prompt_lines: List[str]) -> bool:
+        while True:
+            stdscr.erase()
+            start_y = self._draw_top_telemetry_header(stdscr, title, show_tabs=False)
+            max_y, _ = stdscr.getmaxyx()
+
+            for idx, line in enumerate(prompt_lines):
+                if start_y + 1 + idx >= max_y - 3:
+                    break
+                self._safe_addstr(stdscr, start_y + 1 + idx, 2, line, self.color_warn if idx == 0 else curses.A_NORMAL)
+
+            self._draw_status_bar(stdscr, "[E / Enter] Onayla ve Başlat │ [H / Q / ESC] İptal Et")
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch == curses.KEY_RESIZE:
+                try:
+                    curses.update_lines_cols()
+                except Exception:
+                    pass
+                continue
+            if ch in (ord("e"), ord("E"), 10, 13, curses.KEY_ENTER):
+                return True
+            if ch in (ord("h"), ord("H"), ord("q"), ord("Q"), 27):
+                return False
+
+    def _run_task_with_live_log(self, stdscr: Any, title: str, task_fn: Callable[[], None]) -> None:
+        logs: List[Tuple[str, str]] = []
+
+        def _sink(level: str, msg: str) -> None:
+            logs.append((level, msg))
+            stdscr.erase()
+            top_y = self._draw_top_telemetry_header(stdscr, f"{title} (Çalışıyor...)", show_tabs=False)
+            max_y, _ = stdscr.getmaxyx()
+            avail_rows = max(1, (max_y - 3) - top_y)
+            for idx, (lvl, txt) in enumerate(logs[-avail_rows:]):
+                attr = self.color_ok if lvl == "BİLGİ" else (self.color_warn if lvl == "UYARI" else self.color_err)
+                self._safe_addstr(stdscr, top_y + idx, 2, f"[{lvl}] {txt}", attr)
+            self._draw_status_bar(stdscr, "İşlem yürütülüyor, lütfen bekleyin...")
+            stdscr.refresh()
+
+        set_log_sink(_sink)
+        try:
+            task_fn()
+        except Exception as exc:
+            _sink("HATA", f"Beklenmeyen işlem hatası: {exc}")
+        finally:
+            set_log_sink(None)
+
+        self.refresh_statuses()
+
+        scroll_offset = max(0, len(logs) - 1)
+        while True:
+            stdscr.erase()
+            top_y = self._draw_top_telemetry_header(stdscr, f"{title} (Tamamlandı)", show_tabs=False)
+            max_y, _ = stdscr.getmaxyx()
+            avail_rows = max(1, (max_y - 3) - top_y)
+            max_scroll = max(0, len(logs) - avail_rows)
+            scroll_offset = max(0, min(scroll_offset, max_scroll))
+
+            for idx, (lvl, txt) in enumerate(logs[scroll_offset : scroll_offset + avail_rows]):
+                attr = self.color_ok if lvl == "BİLGİ" else (self.color_warn if lvl == "UYARI" else self.color_err)
+                self._safe_addstr(stdscr, top_y + idx, 2, f"[{lvl}] {txt}", attr)
+
+            self._draw_status_bar(
+                stdscr,
+                f"[↑/↓] Günlük Kaydır ({len(logs)} kayıt) │ [Enter / Space / Q] Pardus Kokpit'e Dön",
+            )
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch == curses.KEY_RESIZE:
+                try:
+                    curses.update_lines_cols()
+                except Exception:
+                    pass
+                continue
+            if ch == curses.KEY_UP:
+                scroll_offset = max(0, scroll_offset - 1)
+            elif ch == curses.KEY_DOWN:
+                scroll_offset = min(max_scroll, scroll_offset + 1)
+            elif ch in (10, 13, curses.KEY_ENTER, ord(" "), ord("q"), ord("Q"), 27):
+                break
+
+    def _screen_self_test(self, stdscr: Any, rollback_mode: bool = False) -> None:
+        tester = SelfTester(self.user_info)
+        rows, all_passed = tester.collect_rows(rollback_mode=rollback_mode)
+        scroll_offset = 0
+
+        while True:
+            stdscr.erase()
+            summary_tag = "TÜM KONTROLLER BAŞARILI" if all_passed else "OPTİMİZE EDİLMEMİŞ AYARLAR MEVCUT"
+            top_y = self._draw_top_telemetry_header(
+                stdscr,
+                f"Sistem Doğrulama Tablosu — {summary_tag}",
+                show_tabs=False,
+            )
+            max_y, max_x = stdscr.getmaxyx()
+
+            c1_w = min(46, max(24, int(max_x * 0.42)))
+            c2_w = min(24, max(14, int(max_x * 0.22)))
+            c3_w = min(22, max(14, int(max_x * 0.20)))
+            c4_w = 12
+
+            header_str = (
+                f" {'BİLEŞEN / AYAR':<{c1_w}} | "
+                f"{'HEDEF DEĞER':<{c2_w}} | "
+                f"{'CANLI DEĞER':<{c3_w}} | "
+                f"{'DURUM':<{c4_w}}"
+            )
+            self._safe_addstr(stdscr, top_y, 1, header_str, self.color_header)
+            self._safe_addstr(stdscr, top_y + 1, 1, "─" * max(0, max_x - 3), self.color_border)
+
+            list_start_y = top_y + 2
+            viewport_h = max(1, (max_y - 3) - list_start_y)
+            max_scroll = max(0, len(rows) - viewport_h)
+            scroll_offset = max(0, min(scroll_offset, max_scroll))
+
+            for vis_idx in range(viewport_h):
+                r_idx = scroll_offset + vis_idx
+                if r_idx >= len(rows):
+                    break
+                comp, exp_val, act_val, status = rows[r_idx]
+                row_text = (
+                    f" {comp[:c1_w]:<{c1_w}} | "
+                    f"{exp_val[:c2_w]:<{c2_w}} | "
+                    f"{act_val[:c3_w]:<{c3_w}} | "
+                    f"{status:<{c4_w}}"
+                )
+                row_attr = (
+                    self.color_ok
+                    if status == "[BAŞARILI]"
+                    else (self.color_err if status == "[BAŞARISIZ]" else self.color_warn)
+                )
+                self._safe_addstr(stdscr, list_start_y + vis_idx, 1, row_text, row_attr)
+
+            self._draw_status_bar(stdscr, "[↑/↓] Kaydır │ [Q / ESC / Enter] Pardus Kokpit'e Dön")
+            stdscr.refresh()
+
+            ch = stdscr.getch()
+            if ch == curses.KEY_RESIZE:
+                try:
+                    curses.update_lines_cols()
+                except Exception:
+                    pass
+                continue
+            if ch == curses.KEY_UP:
+                scroll_offset = max(0, scroll_offset - 1)
+            elif ch == curses.KEY_DOWN:
+                scroll_offset = min(max_scroll, scroll_offset + 1)
+            elif ch in (ord("q"), ord("Q"), 27, 10, 13, curses.KEY_ENTER):
+                break
+
+    def _draw_split_right_pane(
+        self,
+        stdscr: Any,
+        opt: TuningOption,
+        start_y: int,
+        end_y: int,
+        right_x: int,
+        right_w: int,
+        live_override: Optional[Tuple[bool, str]] = None,
+    ) -> None:
+        """
+        Sağ Panel (Teknik Etki ve Donanım Risk Analizi Bölmesi):
+        Sol panelde imlecin üzerinde durduğu ayar için:
+          - Başlık, Kategori, Gösterge Barı ('▰▰▰▰▱▱▱▱'), Canlı Sistem Durumu
+          - [İŞLEV]           : Çalışma mekanizması (COLOR_YELLOW başlık + COLOR_WHITE metin)
+          - [DONANIMA ETKİSİ] : Tespit edilen CPU, GPU, RAM ve Disk üzerindeki etkisi
+          - [RİSK & YAN ETKİ] : Kararlılık veya donanım açısından dikkat edilmesi gerekenler.
+        """
+        if live_override is not None:
+            is_enabled, live_str = live_override
+        else:
+            is_enabled, live_str = self.status_Cache.get(opt.option_id, (False, "Bilinmiyor"))
+
+        wrap_w = max(20, right_w - 4)
+        cur_y = start_y
+
+        def _put_line(text: str, attr: int = curses.A_NORMAL) -> None:
+            nonlocal cur_y
+            if cur_y < end_y:
+                self._safe_addstr(stdscr, cur_y, right_x + 2, text[:wrap_w], attr)
+                cur_y += 1
+
+        def _put_wrapped_section(header_label: str, header_attr: int, body: str) -> None:
+            nonlocal cur_y
+            if cur_y < end_y:
+                _put_line(header_label, header_attr)
+                for w_line in textwrap.wrap(body, width=wrap_w):
+                    if cur_y >= end_y:
+                        break
+                    _put_line(f"  {w_line}", self.color_desc_body)
+                cur_y += 1
+
+        supp_total = max(1, sum(1 for o in self.options if o.supported))
+        supp_active = sum(1 for o in self.options if o.supported and self.status_Cache.get(o.option_id, (False, ""))[0])
+        hud_pct = (supp_active / supp_total) * 100.0
+        hud_bar = self._make_cyber_bar(hud_pct, width=8)
+
+        # Sağ Panel Başlığı ve Canlı Durum Özeti
+        _put_line(f"TEKNİK ETKİ & DONANIM ANALİZİ  [{hud_bar} %{hud_pct:.0f}]", self.color_desc_header)
+        _put_line("─" * wrap_w, self.color_border)
+        _put_line(f"Öğe Adı     : {opt.title}", self.color_desc_body | curses.A_BOLD)
+        _put_line(f"Sekme / Kat : {opt.category}", self.color_category)
+        if not opt.supported:
+            state_badge = "[DESTEKLENMİYOR] ▱▱▱▱▱▱▱▱ (Uyumsuz)"
+            badge_attr = self.color_err
+            live_display = opt.unsupported_reason or "Donanım tarafından desteklenmiyor"
+        else:
+            item_bar = self._make_cyber_bar(100.0 if is_enabled else 0.0, width=8)
+            state_badge = f"[■] ETKİN {item_bar}" if is_enabled else f"[ ] VARSAYILAN {item_bar}"
+            badge_attr = self.color_ok if is_enabled else self.color_inactive
+            live_display = live_str
+        _put_line(f"Durum       : {state_badge}", badge_attr)
+        _put_line(f"Canlı Değer : {live_display}", self.color_desc_body | curses.A_BOLD)
+        _put_line(f"Hedef Ayar  : {opt.target_summary}", self.color_header)
+        _put_line("─" * wrap_w, self.color_border)
+
+        # 1. İşlev (Başlık: COLOR_YELLOW, Metin: COLOR_WHITE)
+        _put_wrapped_section(
+            "■ ÇALIŞMA MEKANİZMASI / İŞLEV:",
+            self.color_desc_header,
+            opt.func_desc,
+        )
+
+        # 2. Donanıma Etkisi (Başlık: COLOR_YELLOW, Metin: COLOR_WHITE)
+        _put_wrapped_section(
+            f"■ TESPİT EDİLEN DONANIMA ETKİSİ ({self.hw_profile.cpu_vendor} / {self.hw_profile.gpu_driver}):",
+            self.color_desc_header,
+            opt.hw_impact,
+        )
+
+        # 3. Risk & Yan Etki (Başlık: COLOR_YELLOW, Metin: COLOR_WHITE)
+        _put_wrapped_section(
+            "■ DONANIM RİSK ANALİZİ & KARARLILIK:",
+            self.color_desc_header,
+            opt.risk_side_effect,
+        )
+
+    def _draw_pardus_logo(self, stdscr: Any, start_y: int, start_x: int) -> None:
+        """Alternatif 2 Orijinal Kurumsal Pars Logosunu orijinal renkleriyle Curses penceresine çizer."""
+        for line_idx, segments in enumerate(PARDUS_LOGO_SEGMENTS):
+            cur_x = start_x
+            for text_part, color_key in segments:
+                attr = curses.color_pair(10) | curses.A_BOLD  # gold
+                if color_key == "green":
+                    attr = curses.color_pair(11) | curses.A_BOLD
+                elif color_key == "white":
+                    attr = curses.color_pair(12) | curses.A_BOLD
+                self._safe_addstr(stdscr, start_y + line_idx, cur_x, text_part, attr)
+                cur_x += len(text_part)
+
+    def _show_welcome_scan_screen(self, stdscr: Any) -> bool:
+        """
+        Açılışta kullanıcıdan yetki ve donanım tarama onayı isteyen
+        dinamik Pardus Kokpit karşılama ve evrensel donanım keşif ekranı.
+        """
+        self.hw_profile = UniversalHardwareDetector.detect(force_refresh=True)
+        self.registry = GranularTuningRegistry(self.state, self.user_info)
+        self.options = self.registry.build_options()
+        self.refresh_statuses()
+        self.symlink_ok, self.symlink_status = install_system_symlink()
+
+        hw = self.hw_profile
+        priv_badge = (
+            "ROOT YETKİSİ DOĞRULANDI (Tam Yazma ve Uygulama Modu)"
+            if is_root()
+            else "KULLANICI MODU (Salt-Okunur Önizleme — Değişiklik için 'sudo' gerekir)"
+        )
+        supported_cnt = sum(1 for o in self.options if o.supported)
+        unsupported_cnt = len(self.options) - supported_cnt
+        compat_pct = (supported_cnt / max(1, len(self.options))) * 100.0
+        compat_bar = self._make_cyber_bar(compat_pct, width=8)
+        ssd_txt = ", ".join(hw.ssd_devices) if hw.ssd_devices else "Yok"
+        hdd_txt = ", ".join(hw.hdd_devices) if hw.hdd_devices else "Yok"
+
+        while True:
+            stdscr.erase()
+            max_y, max_x = stdscr.getmaxyx()
+            top_y = self._draw_top_telemetry_header(
+                stdscr,
+                "PARDUS KOKPİT — KARŞILAMA VE EVRENSEL DONANIM TARAMA ONAY EKRANI",
+                show_tabs=False,
+            )
+            content_end_y = max_y - 3
+            for y_pos in range(top_y, content_end_y):
+                self._safe_addstr(stdscr, y_pos, 0, "│", self.color_border)
+                self._safe_addstr(stdscr, y_pos, max_x - 2, "│", self.color_border)
+            self._safe_addstr(
+                stdscr,
+                content_end_y,
+                0,
+                "╰" + ("─" * max(0, max_x - 3)) + "╯",
+                self.color_border,
+            )
+
+            lines: List[Tuple[str, int]] = [
+                ("■ 1. YETKİ, KISAYOL VE GÜVENLİK DURUMU", self.color_desc_header),
+                (f"  • Çalışma Yetkisi   : {priv_badge}", self.color_ok if is_root() else self.color_warn),
+                (f"  • Sistem Kısayolu   : {SYSTEM_SYMLINK_PATH} -> {self.symlink_status}", self.color_ok if self.symlink_ok else self.color_warn),
+                (f"  • Yedekleme Sistemi : {STATE_FILE} (.bak + JSON Manifesto Aktif)", self.color_desc_body),
+                ("■ 2. OTOMATİK TESPİT EDİLEN DONANIM PROFİLİ (UniversalHardwareDetector)", self.color_desc_header),
+                (f"  • İşlemci (CPU)     : {hw.cpu_model} [{hw.cpu_vendor}, {hw.cpu_cores} Çekirdek]", self.color_desc_body | curses.A_BOLD),
+                (f"  • Güç Yetenekleri   : cpufreq={'Var' if hw.has_cpufreq else 'Yok'}, EPB={'Destekleniyor' if hw.has_intel_epb else 'Desteklenmiyor'}, RAPL={'Destekleniyor' if hw.has_intel_rapl else 'Desteklenmiyor'}, C-State={'Destekleniyor' if hw.has_deep_cstate else 'Yok'}", self.color_desc_body),
+                (f"  • Grafik (GPU)      : {hw.gpu_model} [Sürücü: {hw.gpu_driver}, Boost Tavanı: {hw.gpu_max_boost_mhz} MHz]", self.color_desc_body | curses.A_BOLD),
+                (f"  • Fiziksel Bellek   : {hw.ram_total_gb:.2f} GB RAM  [{self._make_cyber_bar(self._get_ram_usage_percent(), 8)}]", self.color_desc_body | curses.A_BOLD),
+                (f"  • Depolama Birimleri: SSD=[{ssd_txt}] | HDD=[{hdd_txt}]", self.color_desc_body),
+                (f"  • Masaüstü Ortamı   : {hw.desktop_env}", self.color_desc_body),
+                (f"  • Uyumluluk Filtresi: {compat_bar} {supported_cnt} Desteklenen │ {unsupported_cnt} [DESTEKLENMİYOR]", self.color_ok),
+            ]
+
+            # İki Bölmeli Siber-HUD Karşılama Düzeni: Logo (Sol) + Donanım Profili (Sağ)
+            if max_x >= 105:
+                # 1. Sol Bölme: Alternatif 2 Orijinal Renkli Pars Başı
+                logo_x = max(2, (50 - 45) // 2)
+                logo_y = top_y + 1
+                self._draw_pardus_logo(stdscr, logo_y, logo_x)
+
+                # Logo altı kurumsal etiket
+                badge_title = "PARDUS KOKPİT v2.5"
+                badge_sub = "TÜBİTAK ULAKBİM © 2026"
+                self._safe_addstr(stdscr, logo_y + 13, max(2, (50 - len(badge_title)) // 2), badge_title, self.color_desc_header)
+                self._safe_addstr(stdscr, logo_y + 14, max(2, (50 - len(badge_sub)) // 2), badge_sub, self.color_desc_body)
+
+                # Dikey Ayırıcı Hat (Sütun 50)
+                for sep_y in range(top_y, content_end_y):
+                    self._safe_addstr(stdscr, sep_y, 50, "│", self.color_border)
+                self._safe_addstr(stdscr, content_end_y, 50, "┴", self.color_border)
+
+                # 2. Sağ Bölme: Donanım ve Yetki Bilgileri
+                info_x = 53
+                info_w = max(10, max_x - 56)
+                for idx, (txt, attr) in enumerate(lines):
+                    if top_y + 1 + idx >= content_end_y:
+                        break
+                    self._safe_addstr(stdscr, top_y + 1 + idx, info_x, txt[:info_w], attr)
+            elif max_y >= 35:
+                # Dikey İstifleme: Logo üstte ortalı, donanım profili altta
+                logo_x = max(2, (max_x - 45) // 2)
+                self._draw_pardus_logo(stdscr, top_y + 1, logo_x)
+                lines_start_y = top_y + 15
+                for idx, (txt, attr) in enumerate(lines):
+                    if lines_start_y + idx >= content_end_y:
+                        break
+                    self._safe_addstr(stdscr, lines_start_y + idx, 2, txt[: max(0, max_x - 5)], attr)
+            else:
+                # Kompakt Mod (Düşük Terminal Çözünürlüğü)
+                for idx, (txt, attr) in enumerate(lines):
+                    if top_y + idx >= content_end_y:
+                        break
+                    self._safe_addstr(stdscr, top_y + idx, 2, txt[: max(0, max_x - 5)], attr)
+
+            self._draw_status_bar(
+                stdscr,
+                "[Enter / Space / E] Onayla ve Pardus Kokpit'e Gir │ [Y] Yeniden Tara │ [Q / ESC] Çıkış",
+            )
+            stdscr.refresh()
+
+            ch = stdscr.getch()
+            if ch == curses.KEY_RESIZE:
+                try:
+                    curses.update_lines_cols()
+                except Exception:
+                    pass
+                continue
+            if ch in (10, 13, curses.KEY_ENTER, ord(" "), ord("e"), ord("E")):
+                return True
+            if ch in (ord("y"), ord("Y")):
+                self.hw_profile = UniversalHardwareDetector.detect(force_refresh=True)
+                self.registry = GranularTuningRegistry(self.state, self.user_info)
+                self.options = self.registry.build_options()
+                self.refresh_statuses()
+                hw = self.hw_profile
+                continue
+            if ch in (ord("q"), ord("Q"), 27):
+                return False
+
+    def _toggle_single_option(self, stdscr: Any, opt: TuningOption) -> None:
+        """Sol panelde seçili olan tekil ayarı açar veya kapatır ve manifestoya kaydeder."""
+        if not opt.supported:
+            self._show_modal_message(
+                stdscr,
+                "Donanım Uyumluluk Filtresi — [DESTEKLENMİYOR]",
+                [
+                    f"'{opt.title}' ayarı mevcut donanımınızda desteklenmemektedir.",
+                    f"Neden: {opt.unsupported_reason}",
+                ],
+                is_error=True,
+            )
+            return
+
+        # Özel Kokpit Sekmesi Aksiyonları (Self-Test ve Donanım Tarama root gerektirmez)
+        if opt.option_id == "cockpit_self_test":
+            self._screen_self_test(stdscr, rollback_mode=False)
+            self.last_status_msg = "Canlı Sistem Doğrulama Tablosu (Self-Test) görüntülendi."
+            return
+        if opt.option_id == "cockpit_hw_scan":
+            self._show_welcome_scan_screen(stdscr)
+            self.last_status_msg = "Donanım profili yeniden tarandı ve uyumluluk filtreleri güncellendi."
+            return
+
+        if not is_root():
+            self._show_modal_message(
+                stdscr,
+                "Yetki Hatası — Root (sudo) Gerekli",
+                [
+                    f"'{opt.title}' işlemini uygulamak için root (sudo) yetkisi gereklidir.",
+                    "Lütfen programı 'sudo python3 pardus_optimizer.py' komutuyla çalıştırın.",
+                ],
+                is_error=True,
+            )
+            return
+
+        if opt.option_id == "cockpit_apply_all":
+            if self._ask_confirmation(
+                stdscr,
+                "Tüm Donanım ve Çekirdek Ayarlarını Uygula",
+                [
+                    "Desteklenen tüm Güç, Overclock, Bellek, Depolama, Grafik ve Servis optimizasyonları",
+                    "(.bak yedekleri alınarak) tek seferde uygulanacaktır. Onaylıyor musunuz?",
+                ],
+            ):
+                self._run_task_with_live_log(
+                    stdscr,
+                    "Tüm Sistem Optimizasyonları Uygulanıyor",
+                    lambda: self._apply_all_modules(),
+                )
+                self.last_status_msg = "Tüm donanım, çekirdek ve servis optimizasyonları başarıyla uygulandı."
+            return
+
+        if opt.option_id == "cockpit_power_uncap":
+            if self._ask_confirmation(
+                stdscr,
+                "[6] Donanım Güç & Overclock Modülü (Hardware Power Uncap)",
+                [
+                    f"Tespit edilen donanım ({self.hw_profile.cpu_model} & {self.hw_profile.gpu_model}) için:",
+                    f"  1. GPU Saat Kilitleme: gt_min_freq_mhz & gt_boost_freq_mhz -> {self.hw_profile.gpu_max_boost_mhz} MHz",
+                    "  2. Intel EPB: cpu*/power/energy_perf_bias -> 0 (performance)",
+                    "  3. Intel RAPL Güç Sınırı: PL1/PL2 -> 35W (35000000 uW)",
+                    "  4. C-State Düşük Gecikme Modu: Derin uyku (C3/C6) engelleme",
+                    "ayarları yedekli (.bak / JSON manifesto) olarak uygulanacaktır. Onaylıyor musunuz?",
+                ],
+            ):
+                self._run_task_with_live_log(
+                    stdscr,
+                    "[6] Donanım Güç & Overclock Modülü Uygulanıyor",
+                    lambda: HardwarePowerTuner(self.state).apply(),
+                )
+                self.last_status_msg = "[6] Donanım Güç & Overclock Modülü etkinleştirildi."
+            return
+
+        if opt.option_id == "debloat_interactive_wizard":
+            debloater = SystemDebloater(self.state)
+            cands = debloater.scan_installed_candidates()
+            if not cands:
+                self._show_modal_message(
+                    stdscr,
+                    "Paket Temizleme Sihirbazı",
+                    ["Sistemde kaldırılacak kurulu gereksiz paket bulunamadı!"],
+                )
+            else:
+                sel = debloater._curses_checklist_loop(stdscr, cands)
+                if sel:
+                    self._run_task_with_live_log(
+                        stdscr,
+                        f"Paket Temizleme ve APT Simülasyonu ({len(sel)} Paket)",
+                        lambda: debloater.purge_selected_packages(sel),
+                    )
+                    self.last_status_msg = f"{len(sel)} paket güvenli APT simülasyonu ile kaldırıldı."
+            return
+
+        if opt.option_id.startswith("rollback_"):
+            if self._ask_confirmation(
+                stdscr,
+                f"Geri Alma Onayı — {opt.title}",
+                [
+                    f"'{opt.title}' işlemi yürütülecek ve ilgili ayarlar",
+                    "JSON manifestosu / .bak yedeklerinden fabrika değerlerine döndürülecektir.",
+                ],
+            ):
+                self._run_task_with_live_log(
+                    stdscr,
+                    f"Geri Alınıyor: {opt.title}",
+                    lambda: opt.toggle_fn(True),
+                )
+                self.last_status_msg = f"Geri alma tamamlandı: {opt.title}"
+            return
+
+        cur_enabled, _ = self.status_Cache.get(opt.option_id, (False, ""))
+        new_state = True if opt.is_one_shot else (not cur_enabled)
+
+        logs: List[str] = []
+
+        def _mini_sink(lvl: str, msg: str) -> None:
+            logs.append(f"[{lvl}] {msg}")
+
+        set_log_sink(_mini_sink)
+        try:
+            opt.toggle_fn(new_state)
+        except Exception as exc:
+            logs.append(f"[HATA] {exc}")
+        finally:
+            set_log_sink(None)
+
+        self.refresh_statuses()
+        updated_enabled, updated_live = self.status_Cache.get(opt.option_id, (False, ""))
+        action_word = "TETİKLENDİ" if opt.is_one_shot else ("AÇILDI [■]" if updated_enabled else "KAPATILDI [ ]")
+        self.last_status_msg = f"{opt.title} -> {action_word} ({updated_live})"
+
+    def _build_tab_options(self, tab_idx: int) -> List[TuningOption]:
+        """
+        Aktif sekmeye (0..5) ait sol panel TuningOption listesini döndürür:
+          0: [F1] KOKPİT    -> Pardus Kokpit hızlı aksiyonları, kısayol kurulumu + öne çıkan donanım anahtarları
+          1: [F2] GÜÇ & OC  -> OVERCLOCK & GÜÇ KİLİDİ, İŞLEMCİ, GRAFİK
+          2: [F3] DİSK & RAM-> BELLEK, DEPOLAMA, AĞ & PROTOKOL
+          3: [F4] SERVİSLER -> SERVİSLER (TEKİL AÇ/KAPA)
+          4: [F5] DEBLOAT   -> Debloat sihirbazı + tekil paket temizleme/geri yükleme anahtarları
+          5: [F6] GERİ AL   -> Tam ve modüler fabrika ayarlarına dönüş (Rollback) anahtarları
+        """
+        hw = self.hw_profile
+        supported_opts = [o for o in self.options if o.supported and not o.is_one_shot]
+        active_supp = sum(1 for o in supported_opts if self.status_Cache.get(o.option_id, (False, ""))[0])
+
+        if tab_idx == 0:
+            power_opts = [o for o in self.options if o.category == "OVERCLOCK & GÜÇ KİLİDİ" and o.supported]
+            power_active = sum(1 for o in power_opts if self.status_Cache.get(o.option_id, (False, ""))[0])
+            cockpit_items: List[TuningOption] = [
+                TuningOption(
+                    option_id="cockpit_apply_all",
+                    category="PARDUS KOKPİT ANA KONTROL MERKEZİ",
+                    title="[1] Tüm Sistem Optimizasyonlarını Uygula (Tam Performans)",
+                    target_summary="Tüm desteklenen modülleri yedekli (.bak + JSON) uygular",
+                    func_desc=(
+                        "Sistemde tespit edilen donanımla uyumlu tüm Bellek (Sysctl), Depolama (I/O & tmpfs), "
+                        "İşlemci (Governor), Güç & Overclock (EPB/RAPL/GPU Boost/C-State), Grafik ve Systemd "
+                        "servis optimizasyonlarını tek hamlede uygular."
+                    ),
+                    hw_impact=(
+                        f"{hw.cpu_model} ({hw.cpu_cores} çekirdek), {hw.gpu_model} ve {hw.ram_total_gb:.1f} GB RAM "
+                        "üzerinde maksimum masaüstü tepkiselliği ve G/Ç verimi sağlar."
+                    ),
+                    risk_side_effect=(
+                        "Tüm değişiklikler /var/lib/pardus_optimizer/state.json ve .bak yedekleriyle kayıt altına "
+                        "alınır; [F6] GERİ AL sekmesinden tek tuşla geri döndürülebilir."
+                    ),
+                    check_fn=lambda: (
+                        len(supported_opts) > 0 and active_supp == len(supported_opts),
+                        f"{active_supp}/{len(supported_opts)} desteklenen ayar aktif",
+                    ),
+                    toggle_fn=lambda _: self._apply_all_modules(),
+                    is_one_shot=True,
+                ),
+                TuningOption(
+                    option_id="cockpit_power_uncap",
+                    category="PARDUS KOKPİT ANA KONTROL MERKEZİ",
+                    title="[6] Donanım Güç & Overclock Modülünü Tetikle (Power Uncap)",
+                    target_summary=f"GPU={hw.gpu_max_boost_mhz}MHz, EPB=0, RAPL=35W, C-State=C0/C1",
+                    func_desc=(
+                        "HardwarePowerTuner sınıfını çalıştırarak desteklenen donanım düğümlerinde GPU frekans "
+                        "kilitleme, Intel EPB performans modu, RAPL 35W paket güç limiti ve derin C-State "
+                        "uyku engelleme ayarlarını topluca devreye alır."
+                    ),
+                    hw_impact=(
+                        f"CPU ({hw.cpu_vendor}) ve GPU ({hw.gpu_driver}) üzerindeki güç tasarrufu kaynaklı "
+                        "mikro-takılmaları (stutter) ve erken frekans düşürmeyi ortadan kaldırır."
+                    ),
+                    risk_side_effect=(
+                        "Güç tüketimi ve ısı üretimi bir miktar artar; bataryada kullanım süresi kısalabilir."
+                    ),
+                    check_fn=lambda: (
+                        len(power_opts) > 0 and power_active == len(power_opts),
+                        f"{power_active}/{len(power_opts)} güç/OC kilidi aktif",
+                    ),
+                    toggle_fn=lambda _: HardwarePowerTuner(self.state).apply(),
+                    is_one_shot=True,
+                ),
+                TuningOption(
+                    option_id="cockpit_self_test",
+                    category="PARDUS KOKPİT ANA KONTROL MERKEZİ",
+                    title="[3] Canlı Sistem Doğrulama Tablosunu Aç (Self-Test)",
+                    target_summary="/proc, /sys ve systemd canlı durum denetimi",
+                    func_desc=(
+                        "Tüm çekirdek, bellek, disk zamanlayıcı, GPU saat frekansı, RAPL/EPB ve servis "
+                        "durumlarını hedef değerlerle karşılaştıran canlı doğrulama tablosunu açar."
+                    ),
+                    hw_impact="Salt-okunur denetim yapar; donanım üzerinde hiçbir yazma işlemi gerçekleştirmez.",
+                    risk_side_effect="Tamamen güvenlidir; root yetkisi olmadan da incelenebilir.",
+                    check_fn=lambda: (True, "Canlı Telemetri Hazır"),
+                    toggle_fn=lambda _: None,
+                    is_one_shot=True,
+                ),
+                TuningOption(
+                    option_id="cockpit_hw_scan",
+                    category="PARDUS KOKPİT ANA KONTROL MERKEZİ",
+                    title="Evrensel Donanım Keşif & Uyumluluk Raporunu Aç",
+                    target_summary=f"{hw.cpu_vendor} CPU │ {hw.gpu_driver} GPU │ {hw.desktop_env}",
+                    func_desc=(
+                        "UniversalHardwareDetector tarafından taranan CPU, GPU, RAM, SSD/HDD ve Masaüstü "
+                        "Ortamı özetini gösterir; istenirse donanım taramasını yeniler."
+                    ),
+                    hw_impact="Donanım uyumluluk filtrelerini ([DESTEKLENMİYOR]) canlı olarak günceller.",
+                    risk_side_effect="Salt-okunur donanım taraması yapar; hiçbir sistem dosyasını değiştirmez.",
+                    check_fn=lambda: (True, f"{hw.cpu_model[:28]}"),
+                    toggle_fn=lambda _: None,
+                    is_one_shot=True,
+                ),
+                TuningOption(
+                    option_id="cockpit_symlink_install",
+                    category="PARDUS KOKPİT ANA KONTROL MERKEZİ",
+                    title="Sistem Kısayolu ve Sembolik Bağ (/usr/local/bin/pardus-kokpit)",
+                    target_summary=f"{SYSTEM_SYMLINK_PATH} -> {Path(__file__).resolve()}",
+                    func_desc=(
+                        "Pardus Kokpit'in terminalde herhangi bir dizinden doğrudan 'sudo pardus-kokpit' "
+                        "veya 'pardus-kokpit' komutuyla çağrılabilmesi için /usr/local/bin/pardus-kokpit "
+                        "sembolik bağını oluşturur ve çalışma izni (chmod 755) tanımlar."
+                    ),
+                    hw_impact="Sistem PATH dizinine hafif bir sembolik bağ ekler; ek kaynak tüketmez.",
+                    risk_side_effect="Yalnızca /usr/local/bin/pardus-kokpit sembolik bağını günceller.",
+                    check_fn=lambda: install_system_symlink(),
+                    toggle_fn=lambda _: install_system_symlink(),
+                    is_one_shot=True,
+                ),
+            ]
+            # Kokpit altında ayrıca hızlı erişim için Overclock & İşlemci anahtarlarını da listele
+            for opt in self.options:
+                if opt.category in ("OVERCLOCK & GÜÇ KİLİDİ", "İŞLEMCİ"):
+                    cockpit_items.append(opt)
+            for c_opt in cockpit_items[:5]:
+                self.status_Cache[c_opt.option_id] = c_opt.check_fn()
+            return cockpit_items
+
+        if tab_idx == 1:
+            return [
+                o
+                for o in self.options
+                if o.category in ("OVERCLOCK & GÜÇ KİLİDİ", "İŞLEMCİ", "GRAFİK")
+            ]
+
+        if tab_idx == 2:
+            return [
+                o
+                for o in self.options
+                if o.category in ("BELLEK", "DEPOLAMA", "AĞ & PROTOKOL")
+            ]
+
+        if tab_idx == 3:
+            return [
+                o
+                for o in self.options
+                if o.category in ("SERVİSLER (TEKİL AÇ/KAPA)",)
+            ]
+
+        if tab_idx == 4:
+            debloater = SystemDebloater(self.state)
+            installed_tuples = debloater.scan_installed_candidates()
+            installed_lookup = {pkg: (desc, sz) for pkg, desc, sz in installed_tuples}
+            removed_list = self.state.data.get("removed_packages", [])
+
+            debloat_items: List[TuningOption] = [
+                TuningOption(
+                    option_id="debloat_interactive_wizard",
+                    category="ETKİLEŞİMLİ PAKET TEMİZLEME SİHİRBAZI",
+                    title="[2] Etkileşimli APT Debloat Sihirbazını Başlat (Toplu Seçim)",
+                    target_summary="apt-get --simulate korumalı çoklu paket temizliği",
+                    func_desc=(
+                        "Sistemde kurulu olan gereksiz ofis, oyun ve multimedya paketlerini tarar; "
+                        "kritik masaüstü paketlerine (pardus-*, gnome-core, xorg, network-manager) "
+                        "dokunmadan güvenli APT simülasyonu ile kaldırmanızı sağlar."
+                    ),
+                    hw_impact="Disk alanı açar ve arka planda çalışan paket güncelleyici/indeksleyici yükünü azaltır.",
+                    risk_side_effect="Kaldırılan paketler state.json içine kaydedilir; [F6] GERİ AL ile yeniden kurulabilir.",
+                    check_fn=lambda: (
+                        len(installed_lookup) == 0,
+                        f"{len(installed_lookup)} aday paket kurulu │ {len(removed_list)} paket kaldırıldı",
+                    ),
+                    toggle_fn=lambda _: None,
+                    is_one_shot=True,
+                ),
+            ]
+            for opt in self.options:
+                if opt.option_id == "apt_autoremove_clean":
+                    debloat_items.append(opt)
+
+            for pkg_name, desc in DEBLOAT_CANDIDATES.items():
+                opt_id = f"debloat_pkg_{pkg_name}"
+
+                def _chk_pkg(p: str = pkg_name) -> Tuple[bool, str]:
+                    if p in installed_lookup:
+                        _, sz = installed_lookup[p]
+                        return False, f"Kurulu ({sz}) — Kaldırılabilir"
+                    return True, "Temiz (Sistemde kurulu değil)"
+
+                def _tog_pkg(enable_clean: bool, p: str = pkg_name) -> None:
+                    if enable_clean:
+                        debloater.purge_selected_packages([p])
+                    else:
+                        run_cmd(["apt-get", "install", "-y", p], check=False)
+
+                p_opt = TuningOption(
+                    option_id=opt_id,
+                    category="TEKİL PAKET TEMİZLEME ([■]=Temiz / [ ]=Kurulu)",
+                    title=f"{pkg_name:<22} — {desc}",
+                    target_summary=f"apt-get purge {pkg_name} (Güvenli Simülasyonlu)",
+                    func_desc=(
+                        f"'{pkg_name}' ({desc}) paketini APT bağımlılık simülasyonu "
+                        "kontrolünden geçirerek sistemden kaldırır veya tekrar yükler."
+                    ),
+                    hw_impact="Disk alanı kazanımı sağlar ve kullanılmayan arka plan bileşenlerini azaltır.",
+                    risk_side_effect="Kritik bağımlılık tespit edilirse APT güvenlik kilidi işlemi otomatik VETO eder.",
+                    check_fn=_chk_pkg,
+                    toggle_fn=_tog_pkg,
+                )
+                self.status_Cache[opt_id] = p_opt.check_fn()
+                debloat_items.append(p_opt)
+
+            self.status_Cache["debloat_interactive_wizard"] = debloat_items[0].check_fn()
+            return debloat_items
+
+        # tab_idx == 5: [F6] GERİ AL (Rollback & Yedek Manifestosu)
+        backups_cnt = len(self.state.data.get("file_backups", {}))
+        created_cnt = len(self.state.data.get("created_files", []))
+        svcs_cnt = len(self.state.data.get("services", {}))
+        pkgs_cnt = len(self.state.data.get("purged_packages", []))
+        sysfs_cnt = len(self.state.data.get("power_sysfs_originals", {}))
+
+        rollback_items: List[TuningOption] = [
+            TuningOption(
+                option_id="rollback_all",
+                category="FABRİKA AYARLARINA GERİ DÖNÜŞ (TAM ROLLBACK)",
+                title="[5] Tüm Sistem Ayarlarını Fabrika Değerlerine Geri Yükle",
+                target_summary=f"Yedekler: {backups_cnt} .bak, {created_cnt} dosya, {svcs_cnt} servis, {pkgs_cnt} paket",
+                func_desc=(
+                    "StateManager (/var/lib/pardus_optimizer/state.json) manifestosundaki tüm .bak "
+                    "dosya yedeklerini, sysfs güç/overclock kayıtlarını, systemd servis maskelerini "
+                    "ve kaldırılan paketleri fabrika ayarlarına döndürür."
+                ),
+                hw_impact="Tüm donanım, çekirdek ve masaüstü parametrelerini Pardus varsayılanlarına çeker.",
+                risk_side_effect="Tamamen güvenlidir; yalnızca bu araç tarafından değiştirilen kayıtları geri alır.",
+                check_fn=lambda: (
+                    (backups_cnt + created_cnt + svcs_cnt + pkgs_cnt + sysfs_cnt) == 0,
+                    f"Aktif manifesto kaydı: {backups_cnt + created_cnt + svcs_cnt + pkgs_cnt + sysfs_cnt}",
+                ),
+                toggle_fn=lambda _: self._rollback_all_modules(),
+                is_one_shot=True,
+            ),
+            TuningOption(
+                option_id="rollback_power_oc",
+                category="MODÜLER GERİ ALMA SEÇENEKLERİ",
+                title="Donanım Güç & Overclock (GPU / EPB / RAPL / C-State) Geri Al",
+                target_summary=f"Kayıtlı sysfs güç düğümü: {sysfs_cnt}",
+                func_desc=(
+                    "HardwarePowerTuner ve CpuGovernorManager tarafından uygulanan GPU frekans kilidi, "
+                    "Intel EPB, RAPL 35W ve C-State düşük gecikme ayarlarını orijinal değerlerine döndürür."
+                ),
+                hw_impact="İşlemci ve GPU güç yönetimi varsayılan enerji tasarrufu profiline döner.",
+                risk_side_effect="Anında uygulanır, yeniden başlatma gerektirmez.",
+                check_fn=lambda: (sysfs_cnt == 0, f"{sysfs_cnt} güç/sysfs yedeği mevcut"),
+                toggle_fn=lambda _: (
+                    HardwarePowerTuner(self.state).rollback(),
+                    CpuGovernorManager(self.state).rollback(),
+                ),
+                is_one_shot=True,
+            ),
+            TuningOption(
+                option_id="rollback_sysctl_storage",
+                category="MODÜLER GERİ ALMA SEÇENEKLERİ",
+                title="Bellek (Sysctl), Disk Zamanlayıcı, /tmp ve GRUB Ayarlarını Geri Al",
+                target_summary=f"Kayıtlı .bak: {backups_cnt} │ Oluşturulan: {created_cnt}",
+                func_desc=(
+                    "99-pardus-optimizer.conf, udev SSD kuralları, fstab .bak yedeği, journald "
+                    "sınırlandırması ve GRUB çekirdek parametrelerini orijinal haline çevirir."
+                ),
+                hw_impact="RAM takas (swappiness) ve G/Ç zamanlayıcı ayarları varsayılan çekirdek değerlerine döner.",
+                risk_side_effect="GRUB değişikliklerinin tam etkisi için yeniden başlatma önerilir.",
+                check_fn=lambda: (backups_cnt == 0 and created_cnt == 0, f"{backups_cnt} .bak / {created_cnt} ek dosya"),
+                toggle_fn=lambda _: (
+                    StorageAndKernelTuner(self.state).rollback(),
+                    SysctlTuner(self.state).rollback(),
+                ),
+                is_one_shot=True,
+            ),
+            TuningOption(
+                option_id="rollback_services",
+                category="MODÜLER GERİ ALMA SEÇENEKLERİ",
+                title="Systemd Servislerini ve Masaüstü (GNOME/DE) Ayarlarını Geri Al",
+                target_summary=f"Kayıtlı servis durumu: {svcs_cnt}",
+                func_desc=(
+                    "Maskelenen veya durdurulan tüm systemd servislerini (cups, bluetooth, ModemManager, "
+                    "tracker vb.) işlem öncesi aktif/etkin durumlarına geri döndürür."
+                ),
+                hw_impact="Arka plan servisleri ve masaüstü animasyonları yeniden devreye girer.",
+                risk_side_effect="Yazıcı, Bluetooth ve indeksleme servisleri tekrar çalışmaya başlar.",
+                check_fn=lambda: (svcs_cnt == 0, f"{svcs_cnt} servis kaydı mevcut"),
+                toggle_fn=lambda _: (
+                    SystemdManager(self.state).rollback(),
+                    GnomeTuner(self.state, self.user_info).rollback(),
+                ),
+                is_one_shot=True,
+            ),
+            TuningOption(
+                option_id="rollback_packages",
+                category="MODÜLER GERİ ALMA SEÇENEKLERİ",
+                title="Debloat ile Kaldırılan Paketleri Geri Yükle (APT Reinstall)",
+                target_summary=f"Kaldırılan paket kaydı: {pkgs_cnt}",
+                func_desc=(
+                    "SystemDebloater aracılığıyla kaldırılmış olan paketleri APT paket yöneticisi "
+                    "üzerinden otomatik olarak yeniden indirip kurar."
+                ),
+                hw_impact="İnternet bağlantısı üzerinden APT depolarından paket kurulumu yapar.",
+                risk_side_effect="Paket boyutuna bağlı olarak işlem birkaç dakika sürebilir.",
+                check_fn=lambda: (pkgs_cnt == 0, f"{pkgs_cnt} kaldırılmış paket kaydı"),
+                toggle_fn=lambda _: SystemDebloater(self.state).rollback(),
+                is_one_shot=True,
+            ),
+        ]
+        for r_opt in rollback_items:
+            self.status_Cache[r_opt.option_id] = r_opt.check_fn()
+        return rollback_items
+
+    def run_loop(self, stdscr: Any) -> int:
+        """Pardus Kokpit Sekmeli (Tabbed HUD) Split-View Curses TUI ana olay döngüsü."""
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
+        if hasattr(curses, "set_escdelay"):
+            try:
+                curses.set_escdelay(25)
+            except curses.error:
+                pass
+
+        stdscr.keypad(True)
+        self._init_colors()
+        self.refresh_statuses()
+
+        if not self.welcome_shown:
+            if not self._show_welcome_scan_screen(stdscr):
+                return 0
+            self.welcome_shown = True
+
+        while True:
+            stdscr.erase()
+            max_y, max_x = stdscr.getmaxyx()
+
+            if max_y < 16 or max_x < 64:
+                self._safe_addstr(
+                    stdscr,
+                    0,
+                    0,
+                    "Terminal penceresi çok küçük! Pardus Kokpit için büyütün (Min: 64x16).",
+                    curses.A_BOLD,
+                )
+                stdscr.refresh()
+                ch = stdscr.getch()
+                if ch in (ord("q"), ord("Q"), 27, ord("0")):
+                    return 0
+                continue
+
+            # Aktif sekmenin seçeneklerini ve görüntü satırlarını oluştur
+            tab_options = self._build_tab_options(self.active_tab)
+            if not tab_options:
+                tab_options = self.options
+
+            display_rows: List[Tuple[str, Optional[int], str]] = []
+            last_cat = None
+            for idx, opt in enumerate(tab_options):
+                if opt.category != last_cat:
+                    display_rows.append(("CATEGORY", None, f"── {opt.category} ──"))
+                    last_cat = opt.category
+                display_rows.append(("OPTION", idx, opt.title))
+
+            total_opts = len(tab_options)
+            cursor_opt_idx = self.tab_cursors.get(self.active_tab, 0)
+            if cursor_opt_idx >= total_opts:
+                cursor_opt_idx = max(0, total_opts - 1)
+            self.tab_cursors[self.active_tab] = cursor_opt_idx
+            scroll_offset = self.tab_scrolls.get(self.active_tab, 0)
+
+            # Ekranı Sol (%50) ve Sağ (%50) olmak üzere iki bölmeye ayır
+            left_w = max(32, int(max_x * 0.50))
+            right_x = left_w + 1
+            right_w = max(24, max_x - right_x - 2)
+
+            active_tab_title = self.TABS[self.active_tab]
+            top_y = self._draw_top_telemetry_header(
+                stdscr,
+                f"SEKME: {active_tab_title}  │  SOL: [■] Anahtarlar  │  SAĞ: Teknik Analiz & Gösterge",
+                split_col=left_w,
+                show_tabs=True,
+            )
+
+            content_start_y = top_y
+            content_end_y = max_y - 3
+            viewport_h = max(1, content_end_y - content_start_y)
+
+            # Unicode ince ve kavisli kutu çizimleri: Sol, Orta (Ayırıcı) ve Sağ dikey çerçeveler
+            for y_pos in range(content_start_y, content_end_y):
+                self._safe_addstr(stdscr, y_pos, 0, "│", self.color_border)
+                self._safe_addstr(stdscr, y_pos, left_w, "│", self.color_border)
+                self._safe_addstr(stdscr, y_pos, max_x - 2, "│", self.color_border)
+
+            inner_w = max(0, max_x - 3)
+            left_seg = left_w - 1
+            right_seg = max(0, inner_w - left_seg - 1)
+            bottom_box_line = "╰" + ("─" * left_seg) + "┴" + ("─" * right_seg) + "╯"
+            self._safe_addstr(stdscr, content_end_y, 0, bottom_box_line, self.color_border)
+
+            # Seçili option'ın display_rows içindeki satır indeksini bul
+            selected_disp_idx = 0
+            for d_idx, (r_type, o_idx, _) in enumerate(display_rows):
+                if r_type == "OPTION" and o_idx == cursor_opt_idx:
+                    selected_disp_idx = d_idx
+                    break
+
+            if selected_disp_idx < scroll_offset:
+                scroll_offset = selected_disp_idx
+                if scroll_offset > 0 and display_rows[scroll_offset - 1][0] == "CATEGORY":
+                    scroll_offset -= 1
+            elif selected_disp_idx >= scroll_offset + viewport_h:
+                scroll_offset = selected_disp_idx - viewport_h + 1
+            self.tab_scrolls[self.active_tab] = scroll_offset
+
+            # 1. SOL PANEL: Kategorize Edilmiş Ayarlar Listesi ([■] / [ ] / [DESTEKLENMİYOR])
+            avail_left = max(1, left_w - 2)
+            for vis_r in range(viewport_h):
+                d_idx = scroll_offset + vis_r
+                if d_idx >= len(display_rows):
+                    break
+                r_type, o_idx, label = display_rows[d_idx]
+                row_y = content_start_y + vis_r
+
+                if r_type == "CATEGORY" or o_idx is None:
+                    cat_str = f" {label}".ljust(avail_left)
+                    self._safe_addstr(stdscr, row_y, 1, cat_str[:avail_left], self.color_category)
+                else:
+                    opt = tab_options[o_idx]
+                    is_en, _ = self.status_Cache.get(opt.option_id, (False, ""))
+                    is_cur = o_idx == cursor_opt_idx
+                    if not opt.supported:
+                        box = "[DESTEKLENMİYOR]"
+                        attr = self.color_err
+                    else:
+                        box = "[■]" if is_en else "[ ]"
+                        attr = self.color_ok if is_en else self.color_inactive
+                    line_txt = f" {box} {opt.title}".ljust(avail_left)
+
+                    if is_cur:
+                        attr |= curses.A_REVERSE
+                    self._safe_addstr(stdscr, row_y, 1, line_txt[:avail_left], attr)
+
+            # 2. SAĞ PANEL: Seçili Ayarın İşlev, Donanım Etkisi ve Risk Detayı
+            current_opt = tab_options[cursor_opt_idx]
+            self._draw_split_right_pane(
+                stdscr,
+                current_opt,
+                content_start_y,
+                content_end_y,
+                right_x,
+                right_w,
+            )
+
+            # 3. ALT DURUM ÇUBUĞU (Mavi Zemin Üzerine Beyaz Klavye Kılavuzu)
+            self._draw_status_bar(
+                stdscr,
+                "[Tab/←/→/F1-F6/1-6] Sekme │ [↑/↓] Gezin │ [Space/Enter] Aç/Kapa │ [A] Tümü │ [T] Tablo │ [R] Rollback │ [Q] Çıkış",
+            )
+            stdscr.refresh()
+
+            # 4. TUŞ EŞLEMELERİ (Tab / Shift-Tab, Sol/Sağ Ok, 1-6, F1-F6 ve Aksiyon Tuşları)
+            ch = stdscr.getch()
+            if ch == curses.KEY_RESIZE:
+                try:
+                    curses.update_lines_cols()
+                except Exception:
+                    pass
+                continue
+
+            if ch in (9, ord("\t")) or ch == curses.KEY_RIGHT:
+                self.active_tab = (self.active_tab + 1) % len(self.TABS)
+                self.last_status_msg = f"Sekme değiştirildi: {self.TABS[self.active_tab]}"
+            elif ch == curses.KEY_BTAB or ch == curses.KEY_LEFT:
+                self.active_tab = (self.active_tab - 1) % len(self.TABS)
+                self.last_status_msg = f"Sekme değiştirildi: {self.TABS[self.active_tab]}"
+            elif ch in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5"), ord("6")):
+                self.active_tab = ch - ord("1")
+                self.last_status_msg = f"Sekme seçildi: {self.TABS[self.active_tab]}"
+            elif ch in (
+                curses.KEY_F1,
+                curses.KEY_F2,
+                curses.KEY_F3,
+                curses.KEY_F4,
+                curses.KEY_F5,
+                curses.KEY_F6,
+            ):
+                self.active_tab = ch - curses.KEY_F1
+                self.last_status_msg = f"Sekme seçildi: {self.TABS[self.active_tab]}"
+            elif ch == curses.KEY_UP:
+                self.tab_cursors[self.active_tab] = (cursor_opt_idx - 1) % total_opts
+            elif ch == curses.KEY_DOWN:
+                self.tab_cursors[self.active_tab] = (cursor_opt_idx + 1) % total_opts
+            elif ch in (ord(" "), 10, 13, curses.KEY_ENTER):
+                self._toggle_single_option(stdscr, tab_options[cursor_opt_idx])
+            elif ch in (ord("a"), ord("A")):
+                if not is_root():
+                    self._show_modal_message(
+                        stdscr,
+                        "Yetki Hatası",
+                        ["Tüm optimizasyonları uygulamak için 'sudo' yetkisi gereklidir."],
+                        is_error=True,
+                    )
+                    continue
+                if self._ask_confirmation(
+                    stdscr,
+                    "Tüm Donanım ve Çekirdek Ayarlarını Uygula",
+                    [
+                        "Listedeki tüm Bellek, Depolama, İşlemci, Grafik, Ağ ve Servis optimizasyonları",
+                        "(.bak yedekleri alınarak) tek seferde uygulanacaktır. Onaylıyor musunuz?",
+                    ],
+                ):
+                    self._run_task_with_live_log(
+                        stdscr,
+                        "Tüm Sistem Optimizasyonları Uygulanıyor",
+                        lambda: self._apply_all_modules(),
+                    )
+                    self.last_status_msg = "Tüm donanım, çekirdek ve servis optimizasyonları başarıyla uygulandı."
+            elif ch in (ord("d"), ord("D")):
+                self.active_tab = 4
+                self.last_status_msg = f"Sekme seçildi: {self.TABS[self.active_tab]}"
+            elif ch in (ord("t"), ord("T")):
+                self._screen_self_test(stdscr, rollback_mode=False)
+            elif ch in (ord("r"), ord("R")):
+                self.active_tab = 5
+                self.last_status_msg = f"Sekme seçildi: {self.TABS[self.active_tab]}"
+            elif ch in (ord("q"), ord("Q"), 27, ord("0")):
+                return 0
+
+    def _apply_all_modules(self) -> None:
+        install_system_symlink()
+        SysctlTuner(self.state).apply()
+        CpuGovernorManager(self.state).apply()
+        HardwarePowerTuner(self.state).apply()
+        StorageAndKernelTuner(self.state).apply()
+        SystemdManager(self.state).apply()
+        GnomeTuner(self.state, self.user_info).apply()
+
+    def _rollback_all_modules(self) -> None:
+        SystemDebloater(self.state).rollback()
+        GnomeTuner(self.state, self.user_info).rollback()
+        SystemdManager(self.state).rollback()
+        StorageAndKernelTuner(self.state).rollback()
+        HardwarePowerTuner(self.state).rollback()
+        CpuGovernorManager(self.state).rollback()
+        SysctlTuner(self.state).rollback()
+
+
+# Backward compatibility alias
+OptimizerTuiCockpit = OptimizerSplitViewStation
+
+
+# ==============================================================================
+# ANA YÜRÜTÜCÜ VE ARGÜMAN İŞLEYİCİ
+# ==============================================================================
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pardus-kokpit",
+        description=(
+            "Pardus Kokpit — Pardus 25.2 (Debian 13) Evrensel Donanım Algılamalı "
+            "Siber-HUD Sistem Optimizasyon İstasyonu (Tabbed Split-View Curses TUI)"
+        ),
+    )
+    group = parser.add_mutually_exclusive_group(required=False)
+    group.add_argument(
+        "--tui",
+        action="store_true",
+        help="Pardus Kokpit Sekmeli (Tabbed HUD) Curses TUI İstasyonunu başlatır (Varsayılan).",
+    )
+    group.add_argument(
+        "--apply",
+        action="store_true",
+        help="Yedekleri (.bak) alarak tüm bellek, depolama, işlemci, grafik, ağ ve servis optimizasyonlarını uygular.",
+    )
+    group.add_argument(
+        "--debloat",
+        action="store_true",
+        help="Doğrudan Curses Paket Temizleme (Debloat Checklist) ekranını başlatır.",
+    )
+    group.add_argument(
+        "--rollback",
+        action="store_true",
+        help="Alınan yedekleri (.bak) ve durum manifestosunu kullanarak tüm ayarları fabrika değerlerine döndürür.",
+    )
+    group.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Sistemde değişiklik yapmadan tüm granüler ayarların durumunu doğrular ve tablo olarak raporlar.",
+    )
+    group.add_argument(
+        "--install-link",
+        action="store_true",
+        help="/usr/local/bin/pardus-kokpit sembolik bağını kurar.",
+    )
+    parser.add_argument(
+        "--user",
+        type=str,
+        default=None,
+        help="GNOME ve Tracker ayarlarının uygulanacağı hedef masaüstü kullanıcı adı (otomatik tespit edilir).",
+    )
+    return parser
+
+
+def resolve_user(explicit_username: Optional[str]) -> Optional[pwd.struct_passwd]:
+    if explicit_username:
+        try:
+            return pwd.getpwnam(explicit_username)
+        except KeyError:
+            log_error(f"Belirtilen kullanıcı sistemde bulunamadı: {explicit_username}")
+            sys.exit(1)
+    return detect_desktop_user()
+
+
+def execute_apply(user_info: Optional[pwd.struct_passwd]) -> int:
+    require_root_privileges()
+    install_system_symlink()
+    state = StateManager()
+    log_info("=== PARDUS KOKPİT GELİŞMİŞ OPTİMİZASYON İŞLEMİ BAŞLATILIYOR ===")
+    SysctlTuner(state).apply()
+    CpuGovernorManager(state).apply()
+    HardwarePowerTuner(state).apply()
+    StorageAndKernelTuner(state).apply()
+    SystemdManager(state).apply()
+    GnomeTuner(state, user_info).apply()
+    log_info("=== OPTİMİZASYON TAMAMLANDI - DOĞRULAMA TABLOSU ===")
+    tester = SelfTester(user_info)
+    passed = tester.run_checks(rollback_mode=False)
+    return 0 if passed else 2
+
+
+def execute_debloat() -> int:
+    require_root_privileges()
+    install_system_symlink()
+    state = StateManager()
+    SystemDebloater(state).run_wizard()
+    return 0
+
+
+def execute_rollback(user_info: Optional[pwd.struct_passwd]) -> int:
+    require_root_privileges()
+    state = StateManager()
+    log_info("=== PARDUS KOKPİT FABRİKA AYARLARINA GERİ ALMA (ROLLBACK) BAŞLATILIYOR ===")
+    SystemDebloater(state).rollback()
+    GnomeTuner(state, user_info).rollback()
+    SystemdManager(state).rollback()
+    StorageAndKernelTuner(state).rollback()
+    HardwarePowerTuner(state).rollback()
+    CpuGovernorManager(state).rollback()
+    SysctlTuner(state).rollback()
+    log_info("=== GERİ ALMA TAMAMLANDI - DOĞRULAMA TABLOSU ===")
+    tester = SelfTester(user_info)
+    tester.run_checks(rollback_mode=True)
+    return 0
+
+
+def execute_self_test(user_info: Optional[pwd.struct_passwd]) -> int:
+    log_info("Pardus Kokpit Doğrulama (Self-Test) çalıştırılıyor...")
+    tester = SelfTester(user_info)
+    passed = tester.run_checks(rollback_mode=False)
+    return 0 if passed else 1
+
+
+def launch_split_view_station(user_info: Optional[pwd.struct_passwd]) -> int:
+    """Program argümansız veya --tui ile çalıştırıldığında Pardus Kokpit TUI istasyonunu açar."""
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        log_error("Pardus Kokpit Curses TUI İstasyonu için etkileşimli bir terminal (TTY) gereklidir.")
+        return 1
+
+    install_system_symlink()
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+
+    station = OptimizerSplitViewStation(user_info)
+    try:
+        return curses.wrapper(station.run_loop)
+    except Exception as exc:
+        log_error(f"Pardus Kokpit Curses TUI İstasyonu çalıştırılırken hata oluştu: {exc}")
+        return 1
+
+
+def main() -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    if args.install_link:
+        require_root_privileges()
+        ok, msg = install_system_symlink()
+        if ok:
+            log_info(f"Sistem kısayolu hazır: {msg}")
+            return 0
+        log_error(msg)
+        return 1
+
+    user_info = resolve_user(args.user)
+
+    if args.self_test:
+        return execute_self_test(user_info)
+
+    if args.apply:
+        return execute_apply(user_info)
+
+    if args.debloat:
+        return execute_debloat()
+
+    if args.rollback:
+        return execute_rollback(user_info)
+
+    return launch_split_view_station(user_info)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
